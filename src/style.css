@@ -1,0 +1,91 @@
+/* Protection Suite — theme-aware chrome. Reads the dashboard's CSS vars so it reskins with whatever
+   theme is active; build.sh copies it beside the bundle.
+
+   ONLY classes this plugin's bundle actually renders are defined here. The chart palette, the stat
+   tiles, the option list and the detail drawer that were copied from Mission Control are gone with
+   the components that used them: unreferenced CSS for a removed component is how a later lane ends
+   up re-wiring a surface that no longer has a backend. */
+
+.mc-root { display: flex; flex-direction: column; gap: 1.1rem; padding: 1rem 0 3rem; }
+
+.mc-head { display: flex; flex-wrap: wrap; align-items: baseline; gap: .75rem; }
+.mc-title { font-size: 1.4rem; font-weight: 600; letter-spacing: .01em; }
+.mc-sub { font-size: .78rem; color: var(--color-muted-foreground); }
+.mc-spacer { flex: 1 1 auto; }
+
+.mc-card { border: 1px solid var(--color-border); background: var(--color-card); border-radius: var(--radius, .5rem); overflow: hidden; }
+.mc-card-h { display: flex; align-items: baseline; gap: .5rem; padding: .55rem .8rem; border-bottom: 1px solid var(--color-border); }
+.mc-card-t { font-size: .84rem; font-weight: 600; letter-spacing: .02em; }
+.mc-card-s { font-size: .7rem; color: var(--color-muted-foreground); }
+.mc-card-c { padding: .75rem .8rem; display: flex; flex-direction: column; gap: .7rem; }
+
+.mc-row { border: 1px solid var(--color-border); border-radius: var(--radius, .5rem); padding: .6rem .7rem; display: flex; flex-direction: column; gap: .45rem; }
+.mc-row-t { font-size: .86rem; font-weight: 500; }
+.mc-row-m { font-size: .72rem; color: var(--color-muted-foreground); display: flex; flex-wrap: wrap; gap: .4rem .7rem; align-items: center; }
+
+.mc-pill { font-size: .64rem; text-transform: uppercase; letter-spacing: .06em; padding: .12rem .4rem; border-radius: 999px;
+  border: 1px solid var(--color-border); color: var(--color-muted-foreground); white-space: nowrap; }
+.mc-pill-warn { border-color: #ffce3a; color: #ffce3a; }
+.mc-pill-me { border-color: var(--color-primary, var(--color-ring)); color: var(--color-primary, var(--color-foreground)); }
+
+.mc-btn { display: inline-flex; align-items: center; gap: .3rem; border: 1px solid var(--color-border); background: transparent;
+  color: var(--color-foreground); border-radius: var(--radius, .5rem); padding: .3rem .6rem; font-size: .75rem;
+  cursor: pointer; text-decoration: none; }
+.mc-btn:hover:not(:disabled) { border-color: var(--color-ring); }
+.mc-btn:disabled { opacity: .5; cursor: default; }
+.mc-btn-p { background: var(--color-primary, var(--color-ring)); color: var(--color-primary-foreground, #111); border-color: transparent; font-weight: 600; }
+
+table.mc-table { width: 100%; border-collapse: collapse; font-size: .78rem; }
+table.mc-table th { text-align: left; font-weight: 500; font-size: .65rem; text-transform: uppercase; letter-spacing: .07em;
+  color: var(--color-muted-foreground); padding: .25rem .4rem; border-bottom: 1px solid var(--color-border); }
+table.mc-table td { padding: .32rem .4rem; border-bottom: 1px solid color-mix(in srgb, var(--color-border) 55%, transparent); vertical-align: top; }
+table.mc-table tr:hover td { background: color-mix(in srgb, var(--color-ring) 6%, transparent); }
+
+.mc-err { color: var(--color-destructive); font-size: .76rem; }
+.mc-ok { color: #47c48a; font-size: .74rem; }
+.mc-muted { color: var(--color-muted-foreground); font-size: .76rem; }
+
+/* --- card identity + handoff tools --- */
+.mc-tools { display: flex; flex-wrap: wrap; align-items: center; gap: .35rem; }
+.mc-id { font-family: ui-monospace, monospace; font-size: .72rem; letter-spacing: .02em;
+  padding: .12rem .4rem; border-radius: 999px; cursor: pointer;
+  border: 1px dashed var(--color-border); color: var(--color-foreground); opacity: .85; }
+.mc-id:hover { border-color: var(--color-ring); opacity: 1; }
+
+/* ---- Protection Suite additions (one plugin, its own vocabulary) ---- */
+
+.mc-pill-err { border-color: #ff5d5d; color: #ff5d5d; }
+
+/* The tenant banner is not decoration: a screenshot must be unambiguous about which tenant
+   it shows, because a forwarded dashboard is how a multi-tenant leak actually escapes
+   (04-soc-dashboards-automations.md §4.2 r4). The per-tenant COLOUR AND PATTERN are set inline by
+   tenantCss() from a hash of the tenant name, so the same tenant is the same colour in every
+   session and on every profile; these rules are the neutral fallback. */
+.ps-banner {
+  display: flex; align-items: baseline; gap: .6rem; flex-wrap: wrap;
+  border: 1px solid color-mix(in srgb, var(--color-primary, var(--color-ring)) 55%, var(--color-border));
+  background: color-mix(in srgb, var(--color-primary, var(--color-ring)) 10%, transparent);
+  border-radius: var(--radius, .5rem); padding: .5rem .8rem;
+}
+.ps-banner[data-tenant] { border-left-style: solid; }
+.ps-banner-k { font-size: .62rem; letter-spacing: .14em; text-transform: uppercase; color: var(--color-muted-foreground); }
+.ps-banner-v { font-size: 1rem; font-weight: 650; letter-spacing: .02em; }
+
+.ps-switch { display: flex; flex-wrap: wrap; gap: .35rem; }
+
+/* An `unmeasured` line is the honest counterweight to a panel full of numbers. */
+.ps-unm {
+  font-size: .72rem; color: #ffce3a; border-left: 2px solid #ffce3a;
+  padding: .25rem .55rem; white-space: pre-wrap;
+}
+
+/* _unattributed and `all` are not tenants; they must read as different rows at a glance. */
+.ps-unattr td { background: color-mix(in srgb, #ffce3a 8%, transparent); }
+.ps-allrow td { font-weight: 600; border-top: 2px solid var(--color-border); }
+.ps-stale td { background: color-mix(in srgb, #ff5d5d 7%, transparent); }
+
+.ps-sev-critical { border-color: #ff5d5d; color: #ff5d5d; }
+.ps-sev-high { border-color: #ff9f43; color: #ff9f43; }
+.ps-sev-medium { border-color: #ffce3a; color: #ffce3a; }
+.ps-sev-low { border-color: #6f7cff; color: #6f7cff; }
+.ps-sev-info { border-color: var(--color-border); color: var(--color-muted-foreground); }
