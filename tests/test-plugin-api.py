@@ -135,11 +135,18 @@ class ProtectionSuiteApi(unittest.TestCase):
             {"id": "t_3", "title": "PSEC [low] c", "body": body, "assignee": "x", "status": "weird",
              "created_by": "siem-detect", "created_at": 1_700_000_200},
         ])
-        out = m._read_findings(limit=2)
-        self.assertEqual(out["total_before_cap"], 3)
+        pop = m._read_findings()          # the population read is never capped or filtered
+        self.assertEqual(pop["population_total"], 3)
+        self.assertEqual(len(pop["rows"]), 3)
+        out = m.findings(tenant="all", state=None, limit=2, sort="created_at")
+        self.assertEqual(out["population_total"], 3)
+        self.assertEqual(out["in_scope_total"], 3)
         self.assertEqual(out["count"], 2)
-        self.assertTrue(out["cap_hit"], "a capped read must say it was capped")
-        full = m._read_findings(limit=50)
+        self.assertTrue(out["cap_hit"], "a capped page must say it was capped")
+        self.assertEqual(out["lifecycle_counts"]["resolved"], 1,
+                         "lifecycle counts describe the SCOPE, not the page")
+        self.assertEqual(out["lifecycle_counts"]["unrecognised_status"], 1)
+        full = m.findings(tenant="all", state=None, limit=50, sort="created_at")
         by_id = {r["id"]: r for r in full["rows"]}
         self.assertEqual(by_id["t_1"]["lifecycle"], "new")
         self.assertEqual(by_id["t_2"]["lifecycle"], "resolved")
@@ -149,6 +156,87 @@ class ProtectionSuiteApi(unittest.TestCase):
         self.assertEqual(by_id["t_1"]["rule_id"], "alpha_rule_a")
         self.assertEqual(by_id["t_1"]["severity"], "high")
         self.assertEqual(by_id["t_2"]["mttr_seconds"], 400)
+
+    # --- the cap is scoped, not global (round-1 review defect) ----------------
+
+    def _three_findings_one_of_them_alpha(self):
+        """One board: 3 findings, exactly ONE attributable to alpha (by its asset rule)."""
+        (self.home / "scripts" / "platform-registry").mkdir(exist_ok=True)
+        (self.home / "scripts" / "platform-registry" / "alpha.json").write_text(_registry_record("alpha"))
+        body = "Detection: `alpha_rule_a`\nSeverity: high\nSubject: device_x : y\n"
+        rows = [{"id": f"t_{i}", "title": "SIEM [high] x", "body": body, "assignee": "x",
+                 "status": "todo", "created_by": "siem-detect", "created_at": 1_700_000_000 + i}
+                for i in range(3)]
+        rows[0]["body"] = ("Detection: `alpha_rule_a`\nSeverity: high\n"
+                           "Subject: /subscriptions/alpha-sub/vm\n")
+        _make_board(self.home, "b1", rows)
+        return rows
+
+    def test_a_tenant_scope_is_filtered_before_the_cap(self):
+        """A tenant's rows may NOT be dropped by an estate-wide cap and render as a zero.
+
+        Measured on the shipped module before this fix: tenant=alpha with 3 real rows and cap=10
+        returned count=0 with cap_hit while limit=200 returned all 3.
+        """
+        m = _load(self.home, self.artifact)
+        self._three_findings_one_of_them_alpha()
+        small = m.findings(tenant="alpha", state=None, limit=10, sort="created_at")
+        self.assertEqual(small["count"], 1, "alpha's own row must survive a cap it does not exceed")
+        self.assertEqual(small["in_scope_total"], 1)
+        self.assertFalse(small["cap_hit"], "alpha is in scope with 1 row: no cap was hit here")
+        self.assertEqual([r["platform"] for r in small["rows"]], ["alpha"])
+        self.assertEqual(small["population_total"], 3, "the population is still the whole read")
+        self.assertEqual(small["scope_predicate"], "tenant=alpha")
+        big = m.findings(tenant="alpha", state=None, limit=200, sort="created_at")
+        self.assertEqual(big["count"], 1, "the scope's count does not depend on the page size")
+        self.assertEqual(big["in_scope_total"], 1)
+
+    def test_state_filter_is_scoped_and_scoped_counts_are_not_mixed(self):
+        m = _load(self.home, self.artifact)
+        self._three_findings_one_of_them_alpha()
+        out = m.findings(tenant="all", state="new", limit=5, sort="created_at")
+        self.assertEqual(out["in_scope_total"], 3, "all three are `new` (todo)")
+        self.assertEqual(out["count"], 3)
+        self.assertEqual(out["population_total"], 3)
+        self.assertEqual(out["lifecycle_counts"]["resolved"], 0)
+        self.assertIn("state=new", out["scope_predicate"])
+        with self.assertRaises(Exception) as ctx:
+            m.findings(tenant="all", state="resloved", limit=5, sort="created_at")
+        self.assertIn("state must be one of", str(ctx.exception),
+                      "a misspelled state is refused, not rendered as an empty queue")
+
+    def test_ties_are_broken_by_id_so_a_page_is_deterministic(self):
+        m = _load(self.home, self.artifact)
+        _make_board(self.home, "b1", [
+            {"id": f"t_{i}", "title": "SIEM [high] x", "body": "", "assignee": "x", "status": "todo",
+             "created_by": "siem-detect", "created_at": 1_700_000_000}      # every row ties exactly
+            for i in range(5)
+        ])
+        first = [r["id"] for r in m.findings(tenant="all", state=None, limit=3, sort="created_at")["rows"]]
+        second = [r["id"] for r in m.findings(tenant="all", state=None, limit=3, sort="created_at")["rows"]]
+        self.assertEqual(first, second, "a page over a tie must not move between reads")
+        self.assertEqual(first, ["t_4", "t_3", "t_2"], "the documented `id DESC` tiebreaker applies")
+
+    def test_cross_aggregates_uncapped_and_says_so(self):
+        """A KPI over a capped read is not a KPI: 250 open findings must not render as 200."""
+        m = _load(self.home, self.artifact)
+        _make_board(self.home, "b1", [
+            {"id": f"t_{i}", "title": "SIEM [high] x", "body": "", "assignee": "x", "status": "todo",
+             "created_by": "siem-detect", "created_at": 1_700_000_000 + i}
+            for i in range(250)
+        ])
+        x = m.cross()
+        self.assertEqual(x["all"]["open"], 250, "the aggregate counts every open case")
+        self.assertEqual(x["population_total"], 250)
+        self.assertFalse(x["cap_hit"])
+        self.assertFalse(x["capped"])
+        self.assertIsNone(x["cap"])
+        self.assertIn("no LIMIT applied", x["aggregate_scope"])
+        self.assertTrue(x["all_equals_sum"], "every open case is on a row")
+        self.assertFalse(x["tenant_rows_equal_all"],
+                         "with no tenant claiming them, the tenant sum is 0 and all is 250")
+        unattr = [r for r in x["rows"] if r["platform"] == "_unattributed"][0]
+        self.assertEqual(unattr["open"], 250)
 
     def test_unattributed_is_its_own_row_and_all_is_not_the_sum(self):
         m = _load(self.home, self.artifact)
@@ -202,8 +290,32 @@ class ProtectionSuiteApi(unittest.TestCase):
         self.assertEqual(r["sentinel"]["connectors"], 1)
         self.assertEqual(r["defender"]["standard_count"], 1)
 
-    # --- parsing -------------------------------------------------------------
+    def test_the_shadow_proof_key_is_read_under_both_its_names(self):
+        """The gate's key contract: item id, with `sentinel.shadow.7d` accepted as an alias.
 
+        Without the alias a producer writing the obvious `sentinel.shadow` key left the item
+        `unproven` forever, silently — the failure this contract removes.
+        """
+        m = _load(self.home, self.artifact)
+        posture = {"log_analytics_workspaces": [], "sentinel": {}, "defender_pricings": {"value": []}}
+        art = Path(self.tmp.name) / "artifacts2"
+        art.mkdir()
+        (art / "azure-posture.json").write_text(json.dumps(posture))
+        (art / "psec-exit-gate.json").write_text(json.dumps(
+            {"shadow": {"sentinel.shadow.7d": {"green": True, "evidence": "window receipt 2026-09-18"}}}))
+        m2 = _load(self.home, art)
+        r = m2.retirement()
+        by_id = {i["id"]: i for i in r["items"]}
+        self.assertEqual(by_id["sentinel.shadow"]["proof"]["state"], "green",
+                         "the 7d spelling must green the sentinel.shadow item")
+        self.assertEqual(by_id["sentinel.shadow"]["proof"]["key"], "sentinel.shadow.7d",
+                         "the key that answered is echoed back")
+        self.assertEqual(by_id["sentinel.connectors"]["proof"]["state"], "unproven")
+        self.assertEqual(r["items_proven"], 1)
+        self.assertTrue(any("proof key" in u for u in r["unmeasured"]),
+                        "the key contract is named when the gate artifact is read")
+
+    # --- parsing -------------------------------------------------------------
     def test_worker_started_at_style_values_never_become_ages(self):
         m = _load(self.home, self.artifact)
         self.assertIsNone(m._int_or_none("5edae10e-c40b-4149-b267-4c2e7b2f2e7c:60|30722068"))

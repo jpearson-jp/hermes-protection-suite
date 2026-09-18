@@ -43,10 +43,12 @@
         h("button", { className: "mc-btn", onClick: function () { setShowSources(!showSources); } },
           showSources ? "hide sources" : "sources")),
 
-      h("div", { className: "ps-banner" },
+      h("div", { className: "ps-banner", style: tenantCss(current), "data-tenant": current },
         h("span", { className: "ps-banner-k" }, "TENANT"),
         h("span", { className: "ps-banner-v" }, current + (label ? "  ·  " + label : "")),
-        h("span", { className: "mc-muted" }, "switching re-scopes every panel and clears its state")),
+        h("span", { className: "mc-muted" },
+          "switching re-scopes every panel and clears its state; the banner's colour and pattern are "
+          + "this tenant's own (derived from its name), so a screenshot cannot be mistaken for another tenant")),
 
       h("div", { className: "ps-switch" },
         h("button", { className: "mc-btn" + (current === "all" ? " mc-btn-p" : ""), onClick: function () { setTenant("all"); } },
@@ -151,19 +153,24 @@
     if (p.state.error && !d) return h(PsPanel, { title: "Finding queue", error: p.state.error });
     if (!d) return h(PsPanel, { title: "Finding queue", sub: "loading" }, h("div", { className: "mc-muted" }, "…"));
     var rows = d.rows || [];
-    var counts = {};
-    rows.forEach(function (r) { counts[r.lifecycle] = (counts[r.lifecycle] || 0) + 1; });
+    // Counts come from the API's scope-wide tally, never from the page: the table shows at most
+    // `cap` rows, and counting the page would print a number about a DIFFERENT scope than the one
+    // the operator selected (the defect this panel was rebuilt for).
+    var counts = d.lifecycle_counts || {};
     return h(PsPanel, {
       title: "Finding queue — the SOC lifecycle",
-      sub: (d.cap_hit ? rows.length + " of >= " + d.total_before_cap : rows.length + " of " + d.total_before_cap)
-        + " rows · MTTR over cards, not episodes · MTTA unmeasured",
+      sub: "scope " + (d.scope_predicate || ("tenant=" + props.tenant))
+        + " · " + (d.cap_hit ? (rows.length + " of >= " + d.in_scope_total) : (rows.length + " of " + d.in_scope_total))
+        + " rows in scope (of " + d.population_total + " findings read, uncapped)"
+        + " · lifecycle counts are over the whole scope · MTTR over cards, not episodes · MTTA unmeasured",
       as_of: d.as_of, unmeasured: d.unmeasured,
       right: h("span", { className: "mc-row-m" },
         d.lifecycle_vocab.map(function (s) {
           return h(Pill, { key: s, kind: (d.open_states.indexOf(s) >= 0 && counts[s]) ? "mc-pill-warn" : "" },
             s + " " + (counts[s] || 0));
         }),
-        d.unrecognised_status_count ? h(Pill, { kind: "mc-pill-err" }, "unrecognised " + d.unrecognised_status_count) : null)
+        d.unrecognised_status_count ? h(Pill, { kind: "mc-pill-err" }, "unrecognised " + d.unrecognised_status_count) : null,
+        d.cap_hit ? h(Pill, { kind: "mc-pill-warn" }, "page capped at " + d.cap) : null)
     },
       h("div", { className: "mc-row-m" },
         h("button", { className: "mc-btn" + (state === "" ? " mc-btn-p" : ""), onClick: function () { setState(""); } }, "all"),
@@ -201,17 +208,18 @@
     if (!d) return h(PsPanel, { title: "Across tenants", sub: "loading" }, h("div", { className: "mc-muted" }, "…"));
     var rows = d.rows || [];
     var all = d.all || {};
-    var flagged = rows.filter(function (r) {
-      return props.tenant !== "all" && r.platform !== props.tenant && r.is_tenant === false;
-    });
     return h(PsPanel, {
       title: "Across tenants",
-      sub: "one row per tenant, plus _unattributed and all — all is its own query, so all != sum(rows) is visible",
+      sub: "one row per tenant, plus _unattributed and all — all is its own aggregate over the whole population, so all != sum(rows) is visible",
       as_of: d.as_of, unmeasured: d.unmeasured,
       right: h("span", { className: "mc-row-m" },
+        h(Pill, { kind: d.cap_hit ? "mc-pill-warn" : "" },
+          d.cap_hit
+            ? ("capped: " + d.cap + " of " + d.population_total + " — these numbers are a page, not a KPI")
+            : ("uncapped: all " + d.population_total + " findings aggregated")),
         h(Pill, { kind: d.all_equals_sum ? "" : "mc-pill-warn" },
           "all open " + d.all_open + " = rows " + d.sum_of_rows_open
-          + (d.all_equals_sum ? " (own query agrees with the rows)" : " (A ROW IS MISSING)")),
+          + (d.all_equals_sum ? " (own aggregate agrees with the rows)" : " (A ROW IS MISSING)")),
         h(Pill, { kind: d.tenant_rows_equal_all ? "" : "mc-pill-warn" },
           "tenant rows " + d.sum_of_tenant_open + " vs all " + d.all_open
           + (d.tenant_rows_equal_all ? "" : " — _unattributed kept out, never folded in")))

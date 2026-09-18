@@ -17,7 +17,9 @@ this card ``t_4806df6b``). Design is frozen by
 * **No composite risk score** — deliberately not built (§3.4).
 * **Reads only, except the two owner write actions** (§3: the live app is the console, not the
   on-call surface): POST /answer and POST /comment, both routed through ``hermes_cli.kanban_db``,
-  the same code path the CLI and the bundled kanban plugin use.
+  the same code path the CLI and the bundled kanban plugin use. The estate's human ask-inbox is
+  Mission Control's Waiting-on-me tab; these routes exist for the automation tiers and for a
+  tenant-scoped answer, and are not a second inbox (04 §3.4 rule 4).
 
 Sources, in the order each is resolved (a source that is absent is reported, never guessed):
 
@@ -96,8 +98,12 @@ MTTR_EPISODE_NOTE = (
 MAX_LIST_LIMIT = 200
 DEFAULT_LIST_LIMIT = 50
 
-# The two write actions are the only mutations. Everything else is read-only.
-OWNER_AUTHORS = ("jesse", "owner", "owner-answer")
+# The two write actions are the only mutations. Both are owner-authored: every write names the owner
+# as its author, and the two routes exist for (a) the automation tiers' console actions and (b) any
+# surface that wants a tenant-scoped answer. The ESTATE's human ask-inbox is Mission Control's
+# Waiting-on-me tab (it renders the same ask rows and posts to its own /answer); this plugin does not
+# duplicate it (04 §3.4 rule 4: one query layer, or the surfaces will disagree).
+# ``post /answer`` and ``post /comment`` are the routes; there is no anonymous write and no delete.
 
 WORKSPACE_ARTIFACT_DIR = "2026-09-18-protection-suite"
 REGISTRY_DIRNAME = "platform-registry"
@@ -359,6 +365,25 @@ def _tenant_or_refuse(tenant: Optional[str], tenants: list[dict[str, Any]]) -> s
     return value
 
 
+def _states_or_refuse(state: Optional[str]) -> set[str]:
+    """The lifecycle predicate, allowlisted like ``sort`` (04 §3.1).
+
+    An unrecognised state is REFUSED, not silently matched: a filter that matches nothing because it
+    was misspelled renders as an empty queue, which is the same false-zero class as a dropped read.
+    A comma-separated list is accepted (``state=triaging,contained``).
+    """
+    if state is None or not str(state).strip():
+        return set()
+    wanted = {s.strip() for s in str(state).split(",") if s.strip()}
+    unknown = sorted(wanted - set(SOC_STATES))
+    if unknown:
+        raise HTTPException(
+            status_code=400,
+            detail=f"state must be one of {list(SOC_STATES)} (got {unknown})",
+        )
+    return wanted
+
+
 # --- detections catalog ------------------------------------------------------
 
 def _detections() -> dict[str, Any]:
@@ -544,8 +569,16 @@ def _probe_feeds(lake_root: str, feeds: list[dict[str, Any]], legacy: bool) -> d
 # --- kanban ------------------------------------------------------------------
 
 def _boards() -> list[dict[str, Any]]:
-    """Every board, via the library the CLI uses (a dir scan drops the default board)."""
+    """Every board, via the library the CLI uses (a dir scan drops the default board).
+
+    Every accepted ``db_path`` must live INSIDE the resolved hermes home. ``kanban_db``'s board
+    metadata can answer with a path from another home (its registry is not fully home-scoped), and a
+    read that silently crosses into the live estate from a test's temp home is exactly the class of
+    defect this dashboard exists to make visible. A path outside the home is logged and dropped, and
+    the directory scan below still finds this home's own boards.
+    """
     out: list[dict[str, Any]] = []
+    home = _hermes_home().resolve()
     try:
         entries = kanban_db.list_boards(include_archived=False)
     except Exception:  # noqa: BLE001
@@ -555,16 +588,22 @@ def _boards() -> list[dict[str, Any]]:
         db = e.get("db_path")
         if not db or not Path(db).is_file():
             continue
+        try:
+            Path(db).resolve().relative_to(home)
+        except ValueError:
+            log.warning("kanban: ignoring board %r at %s — outside this hermes home (%s)",
+                        e.get("slug"), db, home)
+            continue
         out.append({"slug": e["slug"], "title": e.get("name") or e["slug"], "path": str(db)})
     if out:
         return out
-    root = _hermes_home() / "kanban" / "boards"
+    root = home / "kanban" / "boards"
     if root.is_dir():
         for d in sorted(root.iterdir()):
             db = d / "kanban.db"
             if db.is_file():
                 out.append({"slug": d.name, "title": d.name, "path": str(db)})
-    default_db = _hermes_home() / "kanban.db"
+    default_db = home / "kanban.db"
     if default_db.is_file() and not any(b["slug"] == "default" for b in out):
         out.insert(0, {"slug": "default", "title": "default", "path": str(default_db)})
     return out
@@ -612,19 +651,24 @@ def _parse_finding(body: Optional[str]) -> dict[str, Any]:
     }
 
 
-def _read_findings(state: Optional[str] = None, limit: int = DEFAULT_LIST_LIMIT) -> dict[str, Any]:
-    """The finding queue: rows the detectors filed on the boards, with the SOC lifecycle.
+def _read_findings() -> dict[str, Any]:
+    """The finding queue's POPULATION: rows the detectors filed on the boards, with the SOC lifecycle.
 
     Read directly from each board's SQLite (read-only), not from an API, so the operator surface
-    cannot disagree with the ledger. ``cap_hit`` is reported per board so the page can print
-    ``<n> of >=<n>``.
+    cannot disagree with the ledger.
+
+    Nothing is filtered or capped HERE, on purpose. The scope predicate (tenant, lifecycle state)
+    belongs to the caller and the row cap belongs AFTER it: a cap applied to the whole-estate read
+    makes a scoped read report another scope's numbers, and lets a tenant's rows disappear behind an
+    estate-wide cap and render as a false zero (04 §3.1, §3.4 — "a failed measurement must never
+    render as a zero"). ``population_total`` is therefore the whole read, and every scope's own
+    total is counted by the caller over the filtered rows.
     """
     rows: list[dict[str, Any]] = []
     boards_scanned: list[str] = []
     unmeasured: list[str] = []
     total = 0
-    cap_hit = False
-    placeholders = ",".join("?" for _ in FINDING_CREATORS)
+    placeholders = ", ".join("?" for _ in FINDING_CREATORS)
     for b in _boards():
         try:
             with closing(_ro(b["path"])) as conn:
@@ -635,7 +679,7 @@ def _read_findings(state: Optional[str] = None, limit: int = DEFAULT_LIST_LIMIT)
                     FROM tasks
                     WHERE (created_by IN ({placeholders}) OR title LIKE 'SIEM [%' OR title LIKE 'PSEC [%')
                       AND status != 'archived'
-                    ORDER BY created_at DESC
+                    ORDER BY created_at DESC, id DESC
                     """,
                     FINDING_CREATORS,
                 )
@@ -676,22 +720,12 @@ def _read_findings(state: Optional[str] = None, limit: int = DEFAULT_LIST_LIMIT)
                 "mttr_seconds": ((_int_or_none(r["completed_at"]) - created)
                                  if (_int_or_none(r["completed_at"]) and created) else None),
             })
-    rows.sort(key=lambda x: (x["created_at"] or ""), reverse=True)
-    if len(rows) > limit:
-        cap_hit = True
-        rows = rows[:limit]
-    if state:
-        wanted = {s.strip() for s in str(state).split(",") if s.strip()}
-        rows = [r for r in rows if r["lifecycle"] in wanted]
+    rows.sort(key=lambda x: (x["created_at"] or "", x["id"] or ""), reverse=True)
     return {
         "rows": rows,
-        "count": len(rows),
-        "total_before_cap": total,
-        "cap": limit,
-        "cap_hit": cap_hit,
+        "population_total": total,
         "boards_scanned": boards_scanned,
         "unmeasured": unmeasured,
-        "unrecognised_status_count": sum(1 for r in rows if r["lifecycle"] == "unrecognised_status"),
     }
 
 
@@ -838,25 +872,47 @@ def _defender_facts(posture: Optional[dict[str, Any]]) -> dict[str, Any]:
 # Exit-gate items. The measured value comes from the posture artifact; the *proof* state
 # (shadow window green?) comes from the artifact the exit card writes, and is `unproven` when
 # absent — never assumed green.
+#
+# THE GATE'S KEY CONTRACT (written down here because it is the consuming side of an artifact whose
+# producer, t_eb7d6b90, publishes no schema): ``psec-exit-gate.json`` is either
+#   {"items": [ {id, board, item, measured, proof: {state, evidence}}, ... ]}   <- preferred
+# or
+#   {"shadow": {"<proof key>": {"green": true|false, "evidence": ...}}, ...}
+# where a proof key is the item's ``id``. The one alias that exists is deliberate: the shadow item's
+# id is ``sentinel.shadow`` and the project has also called that proof ``sentinel.shadow.7d``. A
+# producer that writes the obvious key must not leave the item `unproven` forever, so both spellings
+# are read, and the key that actually answered is echoed back as ``proof.key``.
+# Full schema: /home/hermes/hermes-outbox/2026-09-18-protection-suite/exit-gate.schema.json
+PROOF_KEY_ALIASES = {"sentinel.shadow": ("sentinel.shadow.7d", "sentinel.shadow.7")}
+
+
 def _exit_gate_items(posture_path: Optional[str], gate: Optional[dict[str, Any]],
                      sentinel: dict[str, Any], defender: dict[str, Any]) -> list[dict[str, Any]]:
     gate = gate or {}
     items = gate.get("items") if isinstance(gate.get("items"), list) else None
     if items:
         return items
-    def proof(key: str) -> dict[str, Any]:
-        entry = (gate.get("shadow") or {}).get(key)
-        if isinstance(entry, dict) and entry.get("green") is True:
-            return {"state": "green", "evidence": entry.get("evidence")}
-        return {"state": "unproven", "evidence": None}
 
+    def proof(item_id: str) -> dict[str, Any]:
+        shadow = gate.get("shadow")
+        if not isinstance(shadow, dict):
+            shadow = {}
+        for key in (item_id,) + tuple(PROOF_KEY_ALIASES.get(item_id, ())):
+            entry = shadow.get(key)
+            if isinstance(entry, dict) and entry.get("green") is True:
+                return {"state": "green", "evidence": entry.get("evidence"), "key": key}
+        return {"state": "unproven", "evidence": None, "key": None}
+
+    # The item text carries NO live count: the counts move (they are `measured`), and a sentence that
+    # quotes one goes stale on the first new incident (04 §3.4 — a number that reads as live when it
+    # is not is worse than no number).
     return [
         {"id": "sentinel.connectors", "board": "sentinel",
-         "item": "The 7 Microsoft-product connectors' data sources are ingested or recorded as not-needed",
+         "item": "The Microsoft-product connectors' data sources are ingested or recorded as not-needed",
          "measured": {"connectors": sentinel.get("connectors")},
          "proof": proof("sentinel.connectors")},
         {"id": "sentinel.incidents", "board": "sentinel",
-         "item": "The 28 Sentinel incidents are adjudicated (verdict each; stale backlog closed with a reason)",
+         "item": "The Sentinel incidents are adjudicated (verdict each; stale backlog closed with a reason)",
          "measured": sentinel.get("incidents") or {},
          "proof": proof("sentinel.incidents")},
         {"id": "sentinel.fusion", "board": "sentinel",
@@ -867,13 +923,14 @@ def _exit_gate_items(posture_path: Optional[str], gate: Optional[dict[str, Any]]
         {"id": "sentinel.shadow", "board": "sentinel",
          "item": "7-day shadow window vs Sentinel, zero unexplained divergence",
          "measured": {"enabled_workspaces": sentinel.get("enabled_workspaces")},
-         "proof": proof("sentinel.shadow.7d")},
+         "proof": proof("sentinel.shadow")},
         {"id": "defender.substitution", "board": "defender",
-         "item": "22 distinct Defender alert types mapped through the substitution matrix",
+         "item": "The distinct Defender alert types are mapped through the substitution matrix",
          "measured": {"distinct_alert_types": gate.get("defender_distinct_alert_types")},
          "proof": proof("defender.substitution")},
         {"id": "defender.slices", "board": "defender",
-         "item": "13 plans retired one slice at a time, each with a shadow-mode proof + 14 days of comparison",
+         "item": "The plans at Standard are retired one slice at a time, each with a shadow-mode proof "
+                 "+ 14 days of comparison",
          "measured": {"standard_plans": defender.get("standard_count"),
                       "plans_total": defender.get("plans_total")},
          "proof": proof("defender.slices")},
@@ -1095,7 +1152,14 @@ def findings(tenant: Optional[str] = None, state: Optional[str] = None,
              sort: str = Query("created_at")):
     """The finding queue with the SOC lifecycle, MTTA/MTTR and what is stale.
 
-    ``sort`` is an allowlist (04 §3.1): an unknown value is refused, not interpolated.
+    ``sort`` is an allowlist (04 §3.1): an unknown value is refused, not interpolated. So is
+    ``state`` — an unrecognised lifecycle value is refused rather than quietly matching nothing.
+
+    Scope is applied in this order: read the whole population, attribute, filter tenant, filter
+    state, THEN cap the page. The cap therefore bounds the RETURNED rows only; ``in_scope_total`` is
+    the exact count of the scope the operator asked for, and ``population_total`` is the whole read.
+    (A cap applied before the filters makes a tenant read report the estate's numbers and can hide a
+    tenant's rows entirely — the defect this route was rebuilt to remove.)
     """
     allowed_sort = {"created_at": lambda r: r["created_at"] or "",
                     "age": lambda r: -(r["age_seconds"] or 0),
@@ -1106,27 +1170,49 @@ def findings(tenant: Optional[str] = None, state: Optional[str] = None,
                             detail=f"sort must be one of {sorted(allowed_sort)}")
     reg = _load_registry()
     chosen = _tenant_or_refuse(tenant, reg["tenants"])
+    wanted = _states_or_refuse(state)
     cap = _clamp_int(limit, DEFAULT_LIST_LIMIT, 1, MAX_LIST_LIMIT)
-    data = _read_findings(state=state, limit=cap)
+    data = _read_findings()
     rows = _attribute_all(data["rows"], reg["tenants"])
     if chosen != "all":
         rows = [r for r in rows if r["platform"] == chosen]
+    if wanted:
+        rows = [r for r in rows if r["lifecycle"] in wanted]
+    # 04 §3.1's required `id DESC` tiebreaker, applied to the page as well as the COUNT: sorting by
+    # id first and then STABLE-sorting by the chosen key keeps ties in descending-id order, so a
+    # truncated page stops at the same row every time instead of at an arbitrary tie.
+    rows.sort(key=lambda r: r["id"] or "", reverse=True)
     rows.sort(key=allowed_sort[sort])
+    in_scope_total = len(rows)
+    cap_hit = in_scope_total > cap
+    counts: dict[str, int] = {s: 0 for s in SOC_STATES}
+    counts["unrecognised_status"] = 0
+    for r in rows:
+        counts[r["lifecycle"]] = counts.get(r["lifecycle"], 0) + 1
+    page = rows[:cap]
     unmeasured = list(data["unmeasured"]) + list(reg["unmeasured"])
     unmeasured.append("MTTA (delivery): the outbox `sent` timestamp does not exist yet, so time-to-"
                       "delivery is unmeasured — do not read MTTR below as detection responsiveness")
     unmeasured.append("MTTR: " + MTTR_EPISODE_NOTE)
+    scope_predicate = "tenant=" + chosen
+    if wanted:
+        scope_predicate += " & state=" + str(state).strip()
     return {
         "as_of": _as_of(),
         "tenant": chosen,
         "state": state,
-        "rows": rows,
-        "count": len(rows),
+        "rows": page,
+        "count": len(page),
+        # The two scopes are named and never mixed in one number: `count` is the page, `in_scope_total`
+        # is what the operator's tenant+state filter matches, `population_total` is everything read.
+        "in_scope_total": in_scope_total,
+        "population_total": data["population_total"],
         "cap": cap,
-        "cap_hit": data["cap_hit"],
-        "total_before_cap": data["total_before_cap"],
+        "cap_hit": cap_hit,
+        "scope_predicate": scope_predicate,
+        "lifecycle_counts": counts,
         "boards_scanned": data["boards_scanned"],
-        "unrecognised_status_count": data["unrecognised_status_count"],
+        "unrecognised_status_count": counts["unrecognised_status"],
         "lifecycle_vocab": list(SOC_STATES),
         "open_states": list(OPEN_STATES),
         "unmeasured": unmeasured,
@@ -1137,11 +1223,17 @@ def findings(tenant: Optional[str] = None, state: Optional[str] = None,
 def cross():
     """Across tenants: one row per tenant, plus ``_unattributed`` and ``all``.
 
-    ``all`` is computed by its own query, so ``all != sum(rows)`` is visible rather than silently
-    under-counted (04 §3.3). No composite risk score is produced, by design (04 §3.4).
+    ``all`` is its OWN aggregate over the whole population, never the arithmetic of the rows above,
+    so ``all != sum(rows)`` is visible rather than silently under-counted (04 §3.3). No composite
+    risk score is produced, by design (04 §3.4).
+
+    **No LIMIT is applied to this read.** A KPI computed over a capped page is not a KPI (04 §3.1,
+    §3.4): both sides being truncated identically made ``all_equals_sum`` true while open cases were
+    missing. The whole population is read and aggregated, and the response says so — ``capped:
+    false`` with ``population_total`` — instead of leaving a cap flag for the page to ignore.
     """
     reg = _load_registry()
-    data = _read_findings(limit=MAX_LIST_LIMIT)
+    data = _read_findings()
     rows = _attribute_all(data["rows"], reg["tenants"])
     buckets: dict[str, dict[str, Any]] = {}
     for r in rows:
@@ -1160,26 +1252,33 @@ def cross():
     out_rows = []
     for t in reg["tenants"]:
         b = buckets.get(str(t["platform"]), {})
+        row_unmeasured = ["streams: psec lake unwritten"]
+        if not any(b.get(k) for k in ("open", "resolved", "needs_human", "unrecognised")):
+            row_unmeasured.append(
+                "no finding on any board attributes to this tenant — read that as 'nothing is "
+                "attributed', not as 'nothing happened'"
+            )
         out_rows.append(_cross_row(str(t["platform"]), t["display_name"], b,
                                    is_tenant=True, maturity=t["maturity"],
-                                   unmeasured=["streams: psec lake unwritten"]))
+                                   unmeasured=row_unmeasured))
     b = buckets.get("_unattributed", {})
+    unattr_unmeasured = ["no registry asset rule claims these findings — its own row, never "
+                         "folded into a tenant (contract §4.2 r9)"]
+    if not b:
+        unattr_unmeasured.append("nothing is unattributed on any board right now")
     out_rows.append(_cross_row("_unattributed", "Unattributed", b, is_tenant=False,
-                               maturity=None,
-                               unmeasured=["no registry asset rule claims these findings"]))
+                               maturity=None, unmeasured=unattr_unmeasured))
     open_rows = [r for r in rows if r["lifecycle"] in OPEN_STATES]
     total_open = len(open_rows)
-    # `all` is its OWN query over every finding, never the arithmetic of the rows above (04 §3.3):
-    # if a row is missing from the list, `all != sum(rows)` is what makes it visible. Two sums are
-    # reported because they answer different questions: the TENANT sum deliberately excludes
-    # `_unattributed` (folding it into a tenant would be a cross-tenant write, §4.2 r9), and the
-    # ROW sum includes it, so `all_equals_sum` isolates "a row is missing" from "unattributed is
+    # Two sums are reported because they answer different questions: the TENANT sum deliberately
+    # excludes `_unattributed` (folding it into a tenant would be a cross-tenant write, §4.2 r9), and
+    # the ROW sum includes it, so `all_equals_sum` isolates "a row is missing" from "unattributed is
     # kept apart".
     sum_tenant = sum(r["open"] for r in out_rows if r.get("is_tenant"))
     sum_rows = sum(r["open"] for r in out_rows)
     all_row = {
         "platform": "all",
-        "display_name": "ALL (own query, not the sum of the rows above)",
+        "display_name": "ALL (own aggregate over the whole population, not the sum of the rows above)",
         "is_tenant": False,
         "open": total_open,
         "needs_human": sum(1 for r in rows if r["block_kind"] == "needs_input"),
@@ -1203,9 +1302,12 @@ def cross():
         "all_open": total_open,
         "all_equals_sum": total_open == sum_rows,
         "tenant_rows_equal_all": sum_tenant == total_open,
-        "cap": MAX_LIST_LIMIT,
-        "cap_hit": data["cap_hit"],
-        "total_before_cap": data["total_before_cap"],
+        "cap": None,
+        "cap_hit": False,
+        "capped": False,
+        "population_total": data["population_total"],
+        "aggregate_scope": ("every finding on every board read and aggregated; no LIMIT applied "
+                            "(a KPI over a capped read is not a KPI)"),
         "unmeasured": unmeasured,
     }
 
@@ -1223,7 +1325,7 @@ def _cross_row(platform: str, label: str, b: dict[str, Any], is_tenant: bool,
         "resolved": b.get("resolved", 0),
         "unrecognised_status": b.get("unrecognised", 0),
         "maturity": maturity,
-        "unmeasured": unmeasured if (b or not is_tenant) else unmeasured,
+        "unmeasured": list(unmeasured),
     }
 
 
@@ -1249,6 +1351,12 @@ def retirement():
     if not gate_path:
         unmeasured.append("retirement: no psec-exit-gate.json — every item's proof state renders "
                           "`unproven`; absence of proof is not proof")
+    else:
+        unmeasured.append(
+            "retirement: the gate artifact is read by item id as the proof key, with "
+            "`sentinel.shadow.7d`/`.7` accepted as aliases for `sentinel.shadow` "
+            "(exit-gate.schema.json); `proof.key` names the key that answered"
+        )
     spend = _owner_spend_card()
     unmeasured += spend.get("unmeasured", [])
     return {
