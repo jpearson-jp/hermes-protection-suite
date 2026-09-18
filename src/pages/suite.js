@@ -260,6 +260,7 @@
     if (p.state.error && !d) return h(PsPanel, { title: "Coverage matrix", error: p.state.error });
     if (!d) return h(PsPanel, { title: "Coverage matrix", sub: "loading" }, h("div", { className: "mc-muted" }, "…"));
     var rows = d.rows || [];
+    var shadow = d.shadowed || [];
     var tenantCols = [];
     rows.forEach(function (r) {
       (r.cells || []).forEach(function (c) {
@@ -273,6 +274,8 @@
       right: h("span", { className: "mc-row-m" },
         h(Pill, { kind: d.detections_provenance === "scripts-store" ? "" : "mc-pill-warn" },
           "rules: " + (d.detections_provenance || "none")),
+        h(Pill, { kind: shadow.length ? "mc-pill-warn" : "" },
+          "shadowed: " + (d.shadowed_rules_total == null ? "unmeasured" : d.shadowed_rules_total)),
         h(Pill, { kind: Object.keys(d.declared_only || {}).length ? "mc-pill-warn" : "" },
           "declared-not-in-catalog: " + Object.keys(d.declared_only || {}).length + " tenant(s)"))
     },
@@ -290,7 +293,12 @@
                 h(Pill, { kind: c.state === "enabled" ? "" : (c.state === "excluded" ? "mc-pill-me" : "mc-pill-warn") },
                   c.state + (c.state !== "excluded" ? " · " + c.maturity : "")));
             }));
-        }))) : h("div", { className: "mc-muted" }, "no detection index and/or no registry — the matrix cannot be built; that is not an empty matrix"));
+        }))) : h("div", { className: "mc-muted" }, "no detection index and/or no registry — the matrix cannot be built; that is not an empty matrix"),
+      shadow.length ? h("div", { className: "mc-err" },
+        "shadowed — live catalogs this matrix does NOT resolve, so their rules are neither listed above nor zero: " +
+        shadow.map(function (s) {
+          return s.rules.length + " rule(s) in " + s.path + " (" + s.provenance + "): " + s.rules.join(", ");
+        }).join(" · ")) : null);
   }
 
   function RetirementPanel(props) {

@@ -27,6 +27,9 @@ Sources, in the order each is resolved (a source that is absent is reported, nev
                   fallback: the foundation card's own artifact dir, labelled ``wip-outbox``
     detections    <hermes home>/scripts/psec-detections.json               (frozen, contract §5)
                   fallback: siem-detections.json — the live predecessor, labelled ``legacy``
+                  AND: every OTHER live catalog is reported as ``shadowed`` (its file, its
+                  provenance, its rule ids), because resolving one index must never turn a
+                  second live one into a silence — see ``_shadow_report``
     lake          <hermes home>/scripts/psec-sources.json -> lake_root      (frozen, contract §1)
                   the existing endpoint feed (siem-lake-sources.json) is read as a ``legacy``
                   feed with its own schema, labelled as such
@@ -386,17 +389,90 @@ def _states_or_refuse(state: Optional[str]) -> set[str]:
 
 # --- detections catalog ------------------------------------------------------
 
-def _detections() -> dict[str, Any]:
-    """The detection catalog: psec-detections.json if shipped, else the live predecessor."""
-    candidates = [
-        (_scripts_dir() / "psec-detections.json", "scripts-store", "psec"),
-        (_scripts_dir() / "siem-detections.json", "legacy-live", "legacy"),
-    ]
-    for path, provenance, kind in candidates:
+DETECTION_CANDIDATES = (
+    ("psec-detections.json", "scripts-store", "psec"),
+    ("siem-detections.json", "legacy-live", "legacy"),
+)
+
+
+def _catalog_rule_ids(data: Any) -> list[str]:
+    """The rule ids a catalog holds, in EITHER container shape.
+
+    MEASURED 2026-09-18: the two live catalogs differ in shape — ``psec-detections.json`` is
+    ``rules: {id: {...}}`` and ``siem-detections.json`` is ``rules: [{name: …}, …]``. A reader
+    that assumed one shape read the other as empty, which is a failed measurement wearing a
+    zero's clothes. Both shapes are therefore read here, and neither is guessed at.
+    """
+    raw = data.get("rules") if isinstance(data, dict) else None
+    if isinstance(raw, list):
+        return [str(r.get("name") or r.get("rule")) for r in raw
+                if isinstance(r, dict) and (r.get("name") or r.get("rule"))]
+    if isinstance(raw, dict):
+        return [str(k) for k in raw]
+    return []
+
+
+def _shadow_report(chosen: Optional[Path], resolved_ids: set[str]) -> tuple[list[dict], list[str]]:
+    """Every OTHER live detection catalog on this host, as a SHADOW entry — never a silence.
+
+    Resolving the first readable candidate is how the frozen §5 index is preferred. It must not
+    ALSO mean that a second catalog which is LIVE becomes invisible. MEASURED 2026-09-18 on this
+    host: ``siem-detections.json`` is read by ``siem-detect.py`` every 5 minutes (cron job
+    f1ed861d4b6f, ``file_cards: true``) and carries eight calibrated ``edr.*`` rules that are
+    DISJOINT from the three in the frozen index. With only the first-candidate rule, the coverage
+    panel reported three rules as the estate's whole detection coverage with NO ``unmeasured``
+    entry at all — a failed measurement rendered as a complete one, which is the principle this
+    module's docstring states.
+
+    A shadowed catalog is named here (file, provenance, ids); it is distinguished from an ABSENT
+    one (nothing said) and from an UNREADABLE one (its own note, and it is still not zero).
+    """
+    shadowed: list[dict] = []
+    notes: list[str] = []
+    for name, provenance, kind in DETECTION_CANDIDATES:
+        path = _scripts_dir() / name
+        if chosen is not None and path == chosen:
+            continue
         data, err = _read_json(path)
         if err:
-            return {"rules": [], "path": str(path), "provenance": provenance,
-                    "errors": [err], "unmeasured": [f"detections: {path} unreadable: {err}"]}
+            notes.append(f"detections: the other catalog {path} is present but unreadable ({err}) "
+                         "— any rules it holds are unmeasured, never zero")
+            continue
+        if data is None:
+            continue
+        ids = _catalog_rule_ids(data)
+        if not ids:
+            continue
+        extra = [i for i in ids if i not in resolved_ids]
+        if extra:
+            shadowed.append({"path": str(path), "provenance": provenance, "kind": kind,
+                             "count": len(extra), "rules": extra})
+            notes.append(
+                f"detections: {len(extra)} rule(s) are SHADOWED — they live in {path} ({provenance}) "
+                f"and not in the catalog resolved for this panel. They are neither unread nor zero: "
+                f"{', '.join(extra[:10])}" + ("…" if len(extra) > 10 else ""))
+        else:
+            notes.append(f"detections: {path} ({provenance}) carries {len(ids)} rule(s), every one of "
+                         "them also in the resolved catalog — nothing shadowed there")
+    return shadowed, notes
+
+
+def _detections() -> dict[str, Any]:
+    """The detection catalog, plus every other live catalog beside it (see ``_shadow_report``).
+
+    The first READABLE candidate wins (contract §5 freezes ``psec-detections.json`` as the index).
+    A candidate that is PRESENT BUT UNREADABLE is a refusal that names itself — and the other
+    catalog's rules are still reported as shadowed there, rather than the panel rendering a
+    read failure as a zero-rule catalog.
+    """
+    for name, provenance, kind in DETECTION_CANDIDATES:
+        path = _scripts_dir() / name
+        data, err = _read_json(path)
+        if err:
+            shadowed, notes = _shadow_report(path, set())
+            return {"rules": [], "path": str(path), "provenance": provenance, "kind": kind,
+                    "errors": [err], "shadowed": shadowed,
+                    "unmeasured": [f"detections: {path} unreadable: {err}"] + notes}
         if data is None:
             continue
         raw = data.get("rules")
@@ -437,9 +513,12 @@ def _detections() -> dict[str, Any]:
             for r in rules:
                 if not r["maturity"]:
                     r["maturity"] = "unmeasured"
-        return {"rules": rules, "path": str(path), "provenance": provenance,
-                "kind": kind, "errors": [], "unmeasured": unmeasured}
+        shadowed, notes = _shadow_report(path, {r["rule"] for r in rules})
+        unmeasured.extend(notes)
+        return {"rules": rules, "path": str(path), "provenance": provenance, "kind": kind,
+                "errors": [], "shadowed": shadowed, "unmeasured": unmeasured}
     return {"rules": [], "path": None, "provenance": None, "kind": None, "errors": [],
+            "shadowed": [],
             "unmeasured": ["detections: no detection index found (neither psec-detections.json nor "
                            "siem-detections.json) — rules are unknown, not zero"]}
 
@@ -975,7 +1054,7 @@ def meta():
         "registry": {"root": reg["root"], "provenance": reg["provenance"],
                      "tenants": len(reg["tenants"]), "errors": reg["errors"]},
         "detections": {"path": det["path"], "provenance": det["provenance"],
-                       "rules": len(det["rules"])},
+                       "rules": len(det["rules"]), "shadowed": det["shadowed"]},
         "lake": {"root": lake["lake_root"], "provenance": lake["provenance"],
                  "feeds": len(lake["feeds"])},
         "retirement": {"path": post["path"], "provenance": post["provenance"]},
@@ -1142,6 +1221,8 @@ def coverage(tenant: Optional[str] = None):
         "declared_only": declared_only,
         "detections_source": det["path"],
         "detections_provenance": det["provenance"],
+        "shadowed": det["shadowed"],
+        "shadowed_rules_total": sum(s["count"] for s in det["shadowed"]),
         "unmeasured": unmeasured,
     }
 

@@ -87,7 +87,7 @@ the item `unproven` forever, silently.
 | source | frozen home | fallback while the producers are in flight |
 |---|---|---|
 | tenant registry | `~/.hermes/scripts/platform-registry/*.yaml` | the foundation card's artifact dir, labelled `wip-outbox` |
-| detection catalog | `~/.hermes/scripts/psec-detections.json` | `siem-detections.json`, labelled `legacy-live` |
+| detection catalog | `~/.hermes/scripts/psec-detections.json` | `siem-detections.json`, labelled `legacy-live` — and when the frozen index IS resolved, BOTH are still read: the other one is reported as `shadowed` (file, provenance, every rule id) on `/coverage` and `/meta`, because resolving one index must never turn a second LIVE index into a silence |
 | lake | `~/.hermes/scripts/psec-sources.json` → `lake_root` | `siem-lake-sources.json`, labelled `legacy-live` (its schema is the predecessor's, so stream-level panels stay `unmeasured`) |
 | retirement | `azure-posture.json` in the scripts store | the exit measurement's artifact dir, labelled `wip-outbox` |
 | ledger | the kanban boards, via `kanban_db.list_boards()` | — |

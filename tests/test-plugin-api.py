@@ -315,6 +315,116 @@ class ProtectionSuiteApi(unittest.TestCase):
         self.assertTrue(any("proof key" in u for u in r["unmeasured"]),
                         "the key contract is named when the gate artifact is read")
 
+    # --- detections catalog ---------------------------------------------------
+
+    PSEC_THREE = {
+        "_comment": ["fixture"],
+        "rules": {
+            "identity_signin_failure_burst": {"stream": "auth_events", "maturity": "enforcing",
+                                              "suppression_key": ["subject"]},
+            "cloud_privileged_change": {"stream": "cloud_audit", "maturity": "enforcing",
+                                        "suppression_key": ["subject"]},
+            "device_auth_failure_burst": {"stream": "auth_events", "maturity": "enforcing",
+                                          "suppression_key": ["subject"]},
+        },
+    }
+    # The eight live `edr.*` ids, read off the installed siem-detections.json (its container shape
+    # is a LIST, the frozen index's is a DICT — the reader must take both).
+    EDR_EIGHT = ["edr.agent_local_detection", "edr.lolbin_process", "edr.encoded_command",
+                 "edr.run_key_persistence", "edr.defender_tamper", "edr.dns_tunnel",
+                 "edr.script_host_spawn", "edr.device_silent"]
+
+    def _write_catalogs(self, psec=None, siem=None) -> None:
+        d = self.home / "scripts"
+        d.mkdir(parents=True, exist_ok=True)
+        for name, payload in (("psec-detections.json", psec), ("siem-detections.json", siem)):
+            if payload is None:
+                continue
+            (d / name).write_text(payload if isinstance(payload, str) else json.dumps(payload))
+
+    @staticmethod
+    def _siem_eight() -> dict:
+        return {"file_cards": True, "card_assignee": "hermes-smith",
+                "rules": [{"name": n, "title": n, "severity": "high", "window_min": 1440,
+                           "suppression_key": "subject", "sql": "SELECT 1"} for n in
+                          ProtectionSuiteApi.EDR_EIGHT]}
+
+    def test_both_catalogs_present_shadows_are_named_not_dropped(self):
+        """The defect: the frozen §5 index is resolved, and the eight LIVE `edr.*` rules vanish.
+
+        First-readable-candidate is the right resolution order, but a second catalog that a cron
+        job reads every five minutes is not thereby unread — and it is certainly not zero. It is
+        SHADOWED, and the panel must be able to say so.
+        """
+        m = _load(self.home, self.artifact)
+        self._write_catalogs(psec=self.PSEC_THREE, siem=self._siem_eight())
+        d = m._detections()
+        self.assertEqual(d["provenance"], "scripts-store",
+                         "the frozen §5 index is still the resolved catalog")
+        self.assertEqual(sorted(r["rule"] for r in d["rules"]), sorted(self.PSEC_THREE["rules"]))
+        self.assertEqual(len(d["shadowed"]), 1, f"the second catalog is a shadow: {d['shadowed']}")
+        s = d["shadowed"][0]
+        self.assertTrue(s["path"].endswith("siem-detections.json"))
+        self.assertEqual(s["provenance"], "legacy-live")
+        self.assertEqual(s["count"], 8)
+        self.assertEqual(sorted(s["rules"]), sorted(self.EDR_EIGHT))
+        note = [u for u in d["unmeasured"] if "SHADOWED" in u]
+        self.assertTrue(note, f"a shadow must be an unmeasured entry, never a silence: {d['unmeasured']}")
+        for rid in self.EDR_EIGHT:
+            self.assertIn(rid, note[0], "every shadowed rule id is named, not summarised away")
+        self.assertFalse([r for r in d["rules"] if r["rule"] in self.EDR_EIGHT],
+                         "a shadowed rule must not be silently folded into the resolved catalog")
+
+    def test_only_the_predecessor_present_is_labelled_legacy_and_shadows_nothing(self):
+        m = _load(self.home, self.artifact)
+        self._write_catalogs(siem=self._siem_eight())
+        d = m._detections()
+        self.assertEqual(d["provenance"], "legacy-live")
+        self.assertEqual(len(d["rules"]), 8)
+        self.assertTrue(all(r["maturity"] == "unmeasured" for r in d["rules"]),
+                        "the predecessor carries no maturity field — that is unmeasured, not enforcing")
+        self.assertEqual(d["shadowed"], [])
+        self.assertTrue(any("is not installed" in u for u in d["unmeasured"]))
+
+    def test_a_broken_frozen_index_names_the_live_predecessors_rules_not_zero(self):
+        """A read failure of the FIRST candidate must not render the estate as having no rules."""
+        m = _load(self.home, self.artifact)
+        self._write_catalogs(psec="{ this is not json", siem=self._siem_eight())
+        d = m._detections()
+        self.assertEqual(d["rules"], [])
+        self.assertTrue(d["errors"], "the read failure names itself")
+        self.assertEqual(len(d["shadowed"]), 1)
+        self.assertEqual(d["shadowed"][0]["count"], 8)
+        self.assertTrue(any("unreadable" in u for u in d["unmeasured"]))
+        self.assertTrue(any("SHADOWED" in u for u in d["unmeasured"]),
+                        "the live rules are still named while the frozen index is unreadable")
+
+    def test_the_reader_accepts_both_container_shapes(self):
+        """MEASURED: the frozen index is `rules: {id: {...}}`, the predecessor `rules: [{name: …}]`.
+
+        Neither shape may be read as empty — that is the same defect as the shadow, one layer down.
+        """
+        m = _load(self.home, self.artifact)
+        self._write_catalogs(psec=self.PSEC_THREE)
+        dict_shaped = m._detections()
+        self.assertEqual(len(dict_shaped["rules"]), 3)
+        self._write_catalogs(psec={"rules": [{"name": r, "title": r, "stream": "cloud_audit"}
+                                             for r in self.PSEC_THREE["rules"]]})
+        m2 = _load(self.home, self.artifact)
+        list_shaped = m2._detections()
+        self.assertEqual(len(list_shaped["rules"]), 3)
+        self.assertEqual(sorted(r["rule"] for r in dict_shaped["rules"]),
+                         sorted(r["rule"] for r in list_shaped["rules"]))
+        self.assertEqual(sorted(dict_shaped["rules"][0].keys()), sorted(list_shaped["rules"][0].keys()),
+                         "both shapes normalise to the same record")
+
+    def test_both_catalogs_absent_is_unknown_not_zero(self):
+        m = _load(self.home, self.artifact)
+        d = m._detections()
+        self.assertEqual(d["rules"], [])
+        self.assertEqual(d["shadowed"], [])
+        self.assertTrue(any("unknown, not zero" in u for u in d["unmeasured"]), d["unmeasured"])
+
     # --- parsing -------------------------------------------------------------
     def test_worker_started_at_style_values_never_become_ages(self):
         m = _load(self.home, self.artifact)
