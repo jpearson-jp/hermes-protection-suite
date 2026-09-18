@@ -47,6 +47,39 @@ cp "$HERE/templates/manifest.json" "$DIR/dashboard/manifest.json"
 echo "built $NAME -> $bundle ($(wc -c < "$bundle") bytes)"
 node --check "$bundle" && echo "  syntax ok"
 python3 -c "import ast,sys;ast.parse(open('$DIR/dashboard/plugin_api.py').read())" && echo "  plugin_api.py parses"
+
+# --- the DESKTOP half ---------------------------------------------------------
+# The Hermes desktop app does NOT render web-dashboard plugins (upstream, measured:
+# website/docs/user-guide/desktop.md — "the desktop app is self-contained ... never opens or
+# requires the web dashboard"; developer-guide/desktop-plugin-sdk.md — "This is not the
+# web-dashboard plugin SDK ... the three do not share code, APIs, or delivery"). So this package
+# ships a SECOND half at desktop/plugin.js: one route + one sidebar row in the app, over the same
+# /api/plugins/protection-suite/ routes through ctx.rest.
+#
+# Two copies are produced here, for two different consumers:
+#   1. dashboard/dist/desktop-plugin.js — served (unauthenticated, static) so a renderer on ANOTHER
+#      machine can fetch it with one curl; the app's install dialog can also clone the package repo.
+#   2. <hermes home>/desktop-plugins/protection-suite/ — the APP-LEVEL root, which is what the app
+#      loads and what is visible in EVERY profile. Mirroring the app's own copy step (same file +
+#      the same .hermes-package.json marker shape) makes an app whose HERMES_HOME is this box pick
+#      the half up with no rescan. Harmless when the renderer lives on another machine.
+HALF="$HERE/desktop/plugin.js"
+if [ -f "$HALF" ]; then
+  cp "$HALF" "$DIR/dashboard/dist/desktop-plugin.js"
+  echo "  + served copy of the desktop half: dashboard/dist/desktop-plugin.js ($(wc -c < "$DIR/dashboard/dist/desktop-plugin.js") bytes)"
+  cp "$HALF" /tmp/ps-desktop-check.mjs
+  node --check /tmp/ps-desktop-check.mjs && echo "  desktop half syntax ok"
+  rm -f /tmp/ps-desktop-check.mjs
+
+  HERMES_ROOT="$(dirname "$PLUGINS_DIR")"
+  HALF_DST="$HERMES_ROOT/desktop-plugins/$NAME"
+  mkdir -p "$HALF_DST"
+  cp "$HALF" "$HALF_DST/plugin.js"
+  MTIME_MS=$(( $(stat -c %Y "$HALF") * 1000 ))
+  printf '{"package":"%s","source":"%s","sourceMtimeMs":%s}\n' "$NAME" "$HALF" "$MTIME_MS" \
+    > "$HALF_DST/.hermes-package.json"
+  echo "  materialized desktop half -> $HALF_DST  (app-level: every profile)"
+fi
 echo
 echo "Next: enable '$NAME' in plugins.enabled for the root config AND every profile (a user-source"
 echo "plugin absent from a profile's enabled list makes that profile's app view answer 404), then"

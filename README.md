@@ -17,6 +17,35 @@ It is the operator surface of the Protection Suite programme (umbrella kanban `t
       templates/manifest.json     manifest template
       tools/enable-everywhere.py  enable the plugin in the ROOT config AND every profile
       tests/                      the checks that can run without a browser
+      desktop/plugin.js           the DESKTOP half (see below) — app route + sidebar row
+      dashboard/dist/desktop-plugin.js   served copy of the desktop half (fetchable over HTTP)
+
+## Two halves, two surfaces — because they are not the same surface
+
+The Hermes **desktop app** does not render web-dashboard plugins. Upstream is explicit:
+`website/docs/user-guide/desktop.md` — *"The desktop app is self-contained: it runs its own
+`hermes serve` backend and never opens or requires the web dashboard"*; and
+`developer-guide/desktop-plugin-sdk.md` — *"This is not the web-dashboard plugin SDK … The three do
+not share code, APIs, or delivery."* So a `dashboard/manifest.json` tab was never going to appear in
+the app, however correctly it was built, enabled and restarted. A package that wants a tab in the app
+must ship `desktop/plugin.js` — one ESM file, no build step, loading uncompiled (no JSX; only
+`@hermes/plugin-sdk`, `react`, `react/jsx-runtime`).
+
+`desktop/plugin.js` contributes `ROUTES_AREA` (`/protection-suite`) + `SIDEBAR_NAV_AREA` + a status-bar
+chip + palette/keybind entries, and reads the SAME Python routes through `ctx.rest` (scoped to
+`/api/plugins/protection-suite/` by construction, which is what makes it work against a REMOTE
+backend — a bare `fetch` does not). It renders the same panels, including the capability floor, and
+keeps the same honesty rule: what could not be measured is named, never rendered as a zero.
+
+Delivery: the app loads `<hermes home>/desktop-plugins/protection-suite/plugin.js` from **the machine
+the app runs on** (`electron/fs-ipc.ts` resolves it from the main process's `HERMES_HOME`, never the
+connected backend's — `#66899`). `build.sh` therefore also materializes the half at that app-level
+root on this box (harmless when the renderer is elsewhere), and the half is served at
+`/dashboard-plugins/protection-suite/dist/desktop-plugin.js` for a renderer that must fetch it.
+For an app on another machine, install it through the app's own dialog:
+
+    hermes://plugin/install?repo=jpearson-jp/hermes-protection-suite&enable=1
+
 
 ## Surfaces
 
