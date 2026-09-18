@@ -1,0 +1,88 @@
+{
+  "statement_version": 1,
+  "decided": "2026-09-18",
+  "decided_by": "hermes-smith",
+  "decision_card": "t_527e3f35",
+  "decision": "Host prevention (pre-execution blocking), host rollback and kernel-grade self-protection are OUT of the EDR port and out of this suite: they are new engineering, not translation, and the programme's critical path is a Linux event becoming a detection. Control-plane enforcement is IN -- but only where the action is reversible and its inverse ships in the same commit; that half is already shipped by the response layer, so no new project is opened for it. The suite is therefore a DETECT-AND-GATED-RESPOND suite and must never be described as blocking, preventing or rolling back on the host.",
+  "reason": "Measured, three ways. (1) Nothing on Linux evaluates a rule yet: the detector above the sensor is a KQL sweep over ADX, so until a SQL detection runtime exists every other improvement protects an endpoint whose telemetry produces no verdicts. (2) Closing host prevention needs an nftables verdict path, a fail-open design and the inverse in the same commit, and the ONLY real pre_exec path (bpf_lsm) cannot engage on the fleet's distro without a boot-parameter change -- a separate, harder project that does not compress the way a rule port does. Host rollback has nothing to port at all. (3) The retired features that resemble prevention are measured unused (JIT VM access policies: 0; adaptive application controls: unmeasured, no consumers), so there is no measured demand to replace.",
+  "contract_ref": "/home/hermes/hermes-outbox/2026-09-18-protection-suite/PROTECTION-SUITE-CONTRACT.md section 11 (frozen scope); decision record: /home/hermes/hermes-outbox/2026-09-18-protection-suite/DECISION-prevention-rollback-scope.md",
+  "capabilities": [
+    {
+      "id": "detect",
+      "capability": "Detection -- rules evaluated over the lake",
+      "state": "shipped",
+      "promise": "Findings are filed, on their identity digest, as they are detected.",
+      "statement": "Detectors are SQL over the local parquet lake, driven by the decorator registry, and a finding becomes a card on its identity digest. A stream that cannot be read returns `None` (could-not-measure), never an empty result.",
+      "evidence": [
+        "~/.hermes/scripts/opl-detect.py",
+        "~/.hermes/scripts/psec-detections.json",
+        "SIEM lake: /home/hermes/siem-lake"
+      ]
+    },
+    {
+      "id": "respond",
+      "capability": "Gated response -- requested -> delivered -> acked",
+      "state": "shipped",
+      "promise": "A command that was not acked is not claimed as delivered.",
+      "statement": "Containment runs through the signed single-writer command channel with an approval gate; delivery is a state transition that has to be observed, not an assumption made when the request is sent.",
+      "evidence": [
+        "~/.hermes/scripts/psec_response_lib.py"
+      ]
+    },
+    {
+      "id": "respond.inverse",
+      "capability": "Every control action ships WITH its inverse",
+      "state": "shipped",
+      "promise": "An action taken during an incident can be undone.",
+      "statement": "Network isolate / un-isolate, block_ip / unblock_ip and DNS sinkhole apply / remove exist as pairs in the same commit, so containment is reversible by construction rather than by a follow-up.",
+      "evidence": [
+        "~/.hermes/scripts/psec_response_lib.py"
+      ]
+    },
+    {
+      "id": "enforce.control_plane",
+      "capability": "Control-plane enforcement (identity / network / workload)",
+      "state": "shipped",
+      "promise": "This is the WHOLE of the suite's prevention story.",
+      "statement": "In scope, and the only place 'prevention' genuinely exists with a genuine inverse: the reversible network and control-plane actions above, plus the estate's read/act identities. Nothing here blocks code from executing on a host.",
+      "evidence": [
+        "~/.hermes/scripts/psec_response_lib.py"
+      ]
+    },
+    {
+      "id": "prevent.host",
+      "capability": "Host prevention -- blocking execution BEFORE it runs",
+      "state": "out_of_scope",
+      "promise": "NOT CLAIMED. Do not read any number on this dashboard as pre-execution blocking.",
+      "statement": "No pre-exec blocking exists on Linux. `prevention/appliers/linux.ts` is explicit that AppArmor evaluates exec against the PARENT's profile, so the target's execve SUCCEEDS and its code runs -- a statically-linked payload was measured running to completion under an enforcing profile -- and the file carries LinuxDenyClass (`pre_exec` / `post_exec_confinement` / `none`) precisely so the two can never be collapsed. The bpf_lsm branch, the only real pre_exec path, is DORMANT: `setBpfLoader()` has no caller and there is no SEC(\"lsm/...\") program anywhere in the package (re-measured on the tree 2026-09-18). Even with a program written, this host's active LSM list is `lockdown,capability,landlock,yama,apparmor` -- no `bpf` -- so it cannot engage without a boot-parameter change. Prevention is additionally DISARMED by default (audit mode; requires server enforce:true AND DEFEND_LINUX_PREVENTION_ARM=1).",
+      "evidence": [
+        "theone services/rmm/packages/agent-edr/src/prevention/appliers/linux.ts",
+        "theone services/rmm/packages/agent-edr/src/linux/bpf/ (3 CO-RE programs; none is lsm/)",
+        "/sys/kernel/security/lsm (measured on openhands-hgr, 2026-09-18)",
+        "theone docs/decisions/2026-08-03-linux-prevention-is-post-exec-confinement.md"
+      ]
+    },
+    {
+      "id": "rollback.host",
+      "capability": "Host rollback -- undo a file write, a process, or system state",
+      "state": "out_of_scope",
+      "promise": "NOT CLAIMED. There is no undo for a host change.",
+      "statement": "Rollback does not exist. `restore_quarantine` only un-quarantines a file the suite itself quarantined; nothing can undo a kill, and there is no snapshot/restore of files or registry-equivalent system state. A rollback journal is new engineering, not a port.",
+      "evidence": [
+        "theone services/rmm/packages/agent-edr/src/quarantine-inventory.ts",
+        "02-edr-linux-port.md section 4.3"
+      ]
+    },
+    {
+      "id": "tamper.host",
+      "capability": "Host tamper resistance / self-protection",
+      "state": "partial",
+      "promise": "Userspace-only, and stated as such.",
+      "statement": "Userspace-only. `--verify-manifest` at the kernel-load boundary, `ProtectSystem=strict`, a TracerPid tripwire, a watchdog unit and a self-kill refusal at the kill chokepoint -- but anything with root can `kill -9` the sensor and end visibility: there is no kernel-enforced self-protection and no signed attestation in the loop. The self-preservation predicate is itself partial and honestly documented: `ownAgentPids()` covers self + parent only, so the OS-supervised siblings (the eBPF helper, the watchdog) are not covered.",
+      "evidence": [
+        "theone services/rmm/packages/agent-edr/native/linux/loader/loader.c",
+        "02-edr-linux-port.md section 4.4"
+      ]
+    }
+  ]
+}

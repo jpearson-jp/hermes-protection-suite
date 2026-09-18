@@ -22,6 +22,7 @@ It is the operator surface of the Protection Suite programme (umbrella kanban `t
 
 | # | Panel | Route | What it answers |
 |---|---|---|---|
+| 0 | **Capability floor** | `GET /capability` | **what this suite does and, explicitly, what it does NOT do** — host prevention and host rollback render `out_of_scope` from a recorded decision (t_527e3f35); leads the page, and does not re-scope with the tenant switcher |
 | 1 | Liveness | `GET /health?tenant=` | is the instrument ON: per-feed rows, last event, last ingest, assets seen; per-tenant maturity, sources declared, rules enabled |
 | 2 | Finding queue | `GET /findings?tenant=` | the SOC lifecycle per case, age, staleness, disposition, MTTR over cards, and what cannot be measured (MTTA-delivery) |
 | 3 | Across tenants | `GET /cross` | one row per tenant + `_unattributed` + `all` (its own query, so `all != sum(rows)` is visible) |
@@ -29,6 +30,23 @@ It is the operator surface of the Protection Suite programme (umbrella kanban `t
 | 5 | Retirement board | `GET /retirement` | Sentinel/Defender exit items, each with its shadow-proof state and the owner-spend card |
 | — | Provenance | `GET /meta` | what every other route is reading, and what could not be read |
 | — | Owner writes | `POST /answer`, `POST /comment` | record a decision on a card / comment without changing state (via `hermes_cli.kanban_db`) |
+
+### The capability floor — why there is a panel for what the suite does NOT do
+
+`GET /capability` renders `dashboard/capability.json`, the recorded scope decision for kanban
+`t_527e3f35`: **host prevention and host rollback are `out_of_scope`**, control-plane enforcement is
+in scope (and is only ever the reversible actions whose inverse ships with them), and host tamper
+resistance is `partial` (userspace-only). It leads the page because every number below it is only
+readable once that is known: coverage, liveness and a case queue together imply a capability the
+estate does not have, and the measured position is that Linux prevention is post-exec *confinement*
+(the payload runs), `bpf_lsm` is dormant and `bpf` is not in the host's active LSM list, and nothing
+can undo a host change.
+
+A decision is not a measurement, so this record is **versioned with the module and never inferred**;
+it is the dashboard's copy of the decision owned by `PROTECTION-SUITE-CONTRACT.md` §11. If the
+record cannot be read, the API renders a compiled-in floor **with the same two gaps named** and adds
+an `unmeasured` entry — "I could not read the record" may never render as "the suite does
+everything" (`tests/test-plugin-api.py` asserts both arms).
 
 **The owner write surface is API-first, deliberately.** The estate's human ask-inbox is Mission
 Control's *Waiting on me* tab, which renders the same park rows and posts to its own `/answer`. This
@@ -62,6 +80,10 @@ a copied `AskRow`/`CardDetail` that nothing rendered — removed.
   hermes home; such an entry is logged and dropped, so a test (or a profile) can never silently read
   another home's ledger.
 * **No composite risk score** (refused by the contract), and no second push rail.
+* **A capability the suite does not have is stated, not implied.** Host prevention and host rollback
+  render `out_of_scope` on the leading panel; a decision is versioned with the module rather than
+  inferred, and an unreadable capability record falls back to a compiled-in floor that still names
+  the gaps (`t_527e3f35`).
 * **Nothing is cut until proven**: a retirement item whose shadow proof has not been written renders
   `unproven`, never green.
 * **A switch visibly re-scopes.** The tenant banner carries a colour AND stripe pattern derived from
@@ -90,6 +112,7 @@ the item `unproven` forever, silently.
 | detection catalog | `~/.hermes/scripts/psec-detections.json` | `siem-detections.json`, labelled `legacy-live` — and when the frozen index IS resolved, BOTH are still read: the other one is reported as `shadowed` (file, provenance, every rule id) on `/coverage` and `/meta`, because resolving one index must never turn a second LIVE index into a silence |
 | lake | `~/.hermes/scripts/psec-sources.json` → `lake_root` | `siem-lake-sources.json`, labelled `legacy-live` (its schema is the predecessor's, so stream-level panels stay `unmeasured`) |
 | retirement | `azure-posture.json` in the scripts store | the exit measurement's artifact dir, labelled `wip-outbox` |
+| capability floor | `dashboard/capability.json`, shipped inside this plugin and versioned with it | the compiled-in floor in `plugin_api.py`, labelled `compiled-in`, which names the same gaps |
 | ledger | the kanban boards, via `kanban_db.list_boards()` | — |
 
 DuckDB is **not** importable in the dashboard's venv, so the lake probe runs in the lake venv

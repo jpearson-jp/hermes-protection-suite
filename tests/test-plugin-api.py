@@ -425,6 +425,55 @@ class ProtectionSuiteApi(unittest.TestCase):
         self.assertEqual(d["shadowed"], [])
         self.assertTrue(any("unknown, not zero" in u for u in d["unmeasured"]), d["unmeasured"])
 
+    # --- the capability floor (t_527e3f35) ------------------------------------
+
+    def test_capability_floor_names_host_prevention_and_rollback_as_out_of_scope(self):
+        """The two capabilities this suite does NOT have must be P0-visible, not inferred.
+
+        If either of these ever renders `shipped`, the dashboard is claiming a prevention and a
+        rollback the estate does not have — the exact misreading this panel exists to prevent.
+        """
+        m = _load(self.home, self.artifact)
+        out = m.capability()
+        by_id = {r["id"]: r for r in out["rows"]}
+        for gap in ("prevent.host", "rollback.host"):
+            self.assertIn(gap, by_id, f"{gap} must be on the capability floor")
+            self.assertEqual(by_id[gap]["state"], "out_of_scope",
+                             f"{gap} is not built and must never render as available")
+            self.assertTrue(by_id[gap]["statement"], "an out-of-scope row must say what it means")
+            self.assertTrue(by_id[gap]["promise"], "an out-of-scope row must state what is NOT claimed")
+        self.assertEqual(by_id["tamper.host"]["state"], "partial")
+        self.assertGreaterEqual(out["out_of_scope_count"], 2)
+        self.assertEqual(out["provenance"], "plugin", "the versioned record is the source of truth")
+        self.assertEqual(out["decision_card"], "t_527e3f35")
+        self.assertTrue(out["decision"], "the panel must be able to print the decision itself")
+        self.assertTrue(out["reason"], "a decision without its reason is not a recorded decision")
+        self.assertEqual(out["unmeasured"], [], "a readable record leaves nothing unmeasured")
+        for r in out["rows"]:
+            self.assertTrue(r["statement"], f"every capability row says what it means: {r['id']}")
+
+    def test_an_unreadable_capability_record_still_names_the_gaps(self):
+        """'I could not read the record' may never render as 'the suite does everything'."""
+        m = _load(self.home, self.artifact)
+        m.CAPABILITY_FILE = "no-such-capability.json"
+        out = m.capability()
+        self.assertEqual(out["provenance"], "compiled-in")
+        self.assertTrue(out["unmeasured"], "the failed read names itself")
+        self.assertIn("no-such-capability.json", out["unmeasured"][0])
+        ids = {r["id"]: r["state"] for r in out["rows"]}
+        self.assertEqual(ids.get("prevent.host"), "out_of_scope",
+                         "the compiled-in floor still reports the gap, it does not go silent")
+        self.assertEqual(ids.get("rollback.host"), "out_of_scope")
+        self.assertGreaterEqual(out["out_of_scope_count"], 2)
+
+    def test_meta_carries_the_capability_provenance(self):
+        """The 'sources this page is reading' panel is only complete if the floor is one of them."""
+        m = _load(self.home, self.artifact)
+        meta = m.meta()
+        self.assertIn("capability", meta)
+        self.assertEqual(meta["capability"]["provenance"], "plugin")
+        self.assertGreaterEqual(meta["capability"]["out_of_scope"], 2)
+
     # --- parsing -------------------------------------------------------------
     def test_worker_started_at_style_values_never_become_ages(self):
         m = _load(self.home, self.artifact)

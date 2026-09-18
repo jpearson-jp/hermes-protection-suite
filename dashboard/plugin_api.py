@@ -35,6 +35,10 @@ Sources, in the order each is resolved (a source that is absent is reported, nev
                   feed with its own schema, labelled as such
     retirement    azure-posture.json (Sentinel + Defender measured facts, written by the exit
                   measurement) + the OWNER SPEND kanban card + the shadow-proof artifact if present
+    capability    dashboard/capability.json — the recorded SCOPE decision (kanban ``t_527e3f35``):
+                  what this suite does, and explicitly what it does NOT do (no host prevention, no
+                  host rollback). A decision is not a measurement, so it is versioned with the
+                  module and never inferred; see ``_capability``.
 
 The plugin dir is un-versioned live config: ``git init`` lives inside it. Keep the module
 importable at all times — a syntax error here is a tab that answers 500 for every profile.
@@ -1042,6 +1046,137 @@ def _owner_spend_card() -> dict[str, Any]:
 
 # --- endpoints: reads --------------------------------------------------------
 
+# --- the capability floor: a recorded DECISION, not a measurement -------------
+#
+# t_527e3f35 asked whether host prevention and host rollback are in scope. They are not, and the
+# answer is load-bearing for how every other panel may be read: a dashboard that renders coverage,
+# liveness and a finding queue while declining to say "there is no pre-execution blocking and no
+# undo on the host" is a surface that implies a capability the estate does not have.
+#
+# So the floor is read from a versioned record shipped beside this module, and NEVER inferred. When
+# the record cannot be read, the compiled-in floor below is rendered with provenance
+# ``compiled-in`` plus an ``unmeasured`` entry: "I could not read the record" may never render as
+# "the suite does everything".
+CAPABILITY_FILE = "capability.json"
+
+CAPABILITY_FLOOR: dict[str, Any] = {
+    "statement_version": 0,
+    "decided": None,
+    "decided_by": None,
+    "decision_card": "t_527e3f35",
+    "decision": ("Host prevention and host rollback are OUT of the EDR port and out of this suite; "
+                 "control-plane enforcement is IN, and only where the action is reversible with its "
+                 "inverse shipped. The suite is detect-and-gated-respond."),
+    "reason": ("The versioned capability record could not be read, so this compiled-in floor is "
+               "rendered instead. It names the same gaps; the record is authoritative and carries "
+               "the measurements."),
+    "contract_ref": "PROTECTION-SUITE-CONTRACT.md section 11",
+    "capabilities": [
+        {"id": "detect", "capability": "Detection -- rules evaluated over the lake", "state": "shipped",
+         "promise": "Findings are filed as they are detected.",
+         "statement": "Detectors are SQL over the local parquet lake.", "evidence": []},
+        {"id": "respond", "capability": "Gated response -- requested -> delivered -> acked",
+         "state": "shipped", "promise": "A command that was not acked is not claimed as delivered.",
+         "statement": "Signed single-writer command channel with an approval gate.", "evidence": []},
+        {"id": "respond.inverse", "capability": "Every control action ships WITH its inverse",
+         "state": "shipped", "promise": "An action taken during an incident can be undone.",
+         "statement": "isolate/unisolate, block_ip/unblock_ip, dns sinkhole apply/remove.",
+         "evidence": []},
+        {"id": "enforce.control_plane",
+         "capability": "Control-plane enforcement (identity / network / workload)", "state": "shipped",
+         "promise": "This is the WHOLE of the suite's prevention story.",
+         "statement": "Reversible control-plane actions only; nothing here blocks code on a host.",
+         "evidence": []},
+        {"id": "prevent.host", "capability": "Host prevention -- blocking execution BEFORE it runs",
+         "state": "out_of_scope",
+         "promise": "NOT CLAIMED. Do not read any number here as pre-execution blocking.",
+         "statement": ("No pre-exec blocking exists on Linux. What exists is post-exec confinement "
+                       "(AppArmor, parent-profile eval, disarmed by default); bpf_lsm is dormant and "
+                       "no SEC(\"lsm/...\") program exists."),
+         "evidence": []},
+        {"id": "rollback.host", "capability": "Host rollback -- undo a file write, a process, state",
+         "state": "out_of_scope", "promise": "NOT CLAIMED. There is no undo for a host change.",
+         "statement": "Rollback does not exist; quarantine can only un-quarantine what it took.",
+         "evidence": []},
+        {"id": "tamper.host", "capability": "Host tamper resistance / self-protection",
+         "state": "partial", "promise": "Userspace-only, and stated as such.",
+         "statement": ("Userspace-only: root can kill -9 the sensor and end visibility; no "
+                       "kernel-enforced self-protection."),
+         "evidence": []},
+    ],
+}
+
+
+def _capability() -> dict[str, Any]:
+    """Read the recorded capability floor, or fall back to the compiled-in one — never to silence."""
+    path = Path(__file__).resolve().parent / CAPABILITY_FILE
+    data, err = _read_json(path)
+    unmeasured: list[str] = []
+    if isinstance(data, dict) and isinstance(data.get("capabilities"), list) and data["capabilities"]:
+        provenance = "plugin"
+    else:
+        data = CAPABILITY_FLOOR
+        provenance = "compiled-in"
+        unmeasured.append(
+            f"capability: {path} "
+            + (f"unreadable: {err}" if err else "missing")
+            + " — the compiled-in floor is rendered instead of the versioned record; it names the "
+              "same host prevention/rollback gaps, but the record is authoritative"
+        )
+    rows = []
+    for c in data.get("capabilities", []):
+        rows.append({
+            "id": c.get("id"),
+            "capability": c.get("capability"),
+            "state": c.get("state") or "unmeasured",
+            "promise": c.get("promise"),
+            "statement": c.get("statement"),
+            "evidence": list(c.get("evidence") or []),
+        })
+    return {
+        "path": str(path),
+        "provenance": provenance,
+        "statement_version": data.get("statement_version"),
+        "decided": data.get("decided"),
+        "decided_by": data.get("decided_by"),
+        "decision_card": data.get("decision_card"),
+        "decision": data.get("decision"),
+        "reason": data.get("reason"),
+        "contract_ref": data.get("contract_ref"),
+        "rows": rows,
+        "unmeasured": unmeasured,
+    }
+
+
+@router.get("/capability")
+def capability():
+    """The capability floor: what this suite does, and explicitly what it does NOT do.
+
+    Estate-wide on purpose — a scope decision is not a tenant's, so this route takes no tenant and
+    the panel does not re-scope. ``out_of_scope_count`` is the number to read first: those are the
+    capabilities this dashboard must never be taken to imply.
+    """
+    cap = _capability()
+    rows = cap["rows"]
+    return {
+        "as_of": _as_of(),
+        "statement_version": cap["statement_version"],
+        "decided": cap["decided"],
+        "decided_by": cap["decided_by"],
+        "decision_card": cap["decision_card"],
+        "decision": cap["decision"],
+        "reason": cap["reason"],
+        "contract_ref": cap["contract_ref"],
+        "rows": rows,
+        "count": len(rows),
+        "out_of_scope_count": sum(1 for r in rows if r["state"] == "out_of_scope"),
+        "partial_count": sum(1 for r in rows if r["state"] == "partial"),
+        "source": cap["path"],
+        "provenance": cap["provenance"],
+        "unmeasured": cap["unmeasured"],
+    }
+
+
 @router.get("/meta")
 def meta():
     """What every other route is reading — the provenance panel, and the honest source census."""
@@ -1049,6 +1184,7 @@ def meta():
     det = _detections()
     lake = _lake_config()
     post = _posture()
+    cap = _capability()
     return {
         "as_of": _as_of(),
         "registry": {"root": reg["root"], "provenance": reg["provenance"],
@@ -1058,7 +1194,10 @@ def meta():
         "lake": {"root": lake["lake_root"], "provenance": lake["provenance"],
                  "feeds": len(lake["feeds"])},
         "retirement": {"path": post["path"], "provenance": post["provenance"]},
-        "unmeasured": reg["unmeasured"] + det["unmeasured"] + lake["unmeasured"] + post["unmeasured"],
+        "capability": {"path": cap["path"], "provenance": cap["provenance"],
+                       "out_of_scope": sum(1 for r in cap["rows"] if r["state"] == "out_of_scope")},
+        "unmeasured": (reg["unmeasured"] + det["unmeasured"] + lake["unmeasured"]
+                       + post["unmeasured"] + cap["unmeasured"]),
         "boards": [b["slug"] for b in _boards()],
     }
 

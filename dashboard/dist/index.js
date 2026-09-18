@@ -173,6 +173,10 @@
  * number that matters is open cases; everything else is a breakdown of how that number is
  * distributed and how long it has been true.
  *
+ * The FIRST panel is the capability floor (t_527e3f35): what this suite does, and the two things
+ * it deliberately does NOT do — there is no pre-execution blocking and no host rollback. It leads
+ * because every number below it is only readable once that is known.
+ *
  * Switching tenant is an explicit RE-SCOPE (§4.2 r4): the whole subtree is keyed on the tenant so
  * every piece of child state (filters, open rows, caches) is discarded, and the banner changes.
  */
@@ -237,17 +241,73 @@
             h("tr", null, h("td", null, "detections"), h("td", null, (m.detections || {}).path || "—"), h("td", null, ((m.detections || {}).rules) + " rules (" + ((m.detections || {}).provenance) + ")")),
             h("tr", null, h("td", null, "lake"), h("td", null, (m.lake || {}).root || "—"), h("td", null, ((m.lake || {}).feeds) + " feeds (" + ((m.lake || {}).provenance) + ")")),
             h("tr", null, h("td", null, "retirement"), h("td", null, (m.retirement || {}).path || "—"), h("td", null, String((m.retirement || {}).provenance))),
+            h("tr", null, h("td", null, "capability"), h("td", null, (m.capability || {}).path || "—"), h("td", null, String((m.capability || {}).provenance) + " · " + ((m.capability || {}).out_of_scope == null ? "unmeasured" : (m.capability.out_of_scope + " out of scope")))),
             h("tr", null, h("td", null, "boards"), h("td", null, "kanban"), h("td", null, (m.boards || []).join(", "))),
             h("tr", null, h("td", null, "synthetic rows"), h("td", null, (t.synthetic_rows || []).join(", ")), h("td", null, "never folded into a tenant"))),
         ),
         (m.unmeasured || []).length ? h("div", { className: "mc-err" }, "unmeasured: " + (m.unmeasured || []).join(" · ")) : null) : null,
 
       h("div", { key: "scope-" + current },
+        h(CapabilityPanel),
         h(LivenessPanel, { tenant: current, onError: null }),
         h(FindingsPanel, { tenant: current }),
         h(CrossPanel, { tenant: current }),
         h(CoveragePanel, { tenant: current }),
         h(RetirementPanel, { tenant: current })));
+  }
+
+  /* The capability floor — FIRST panel on purpose.
+   *
+   * Before any number below it is read, the operator has to know what this surface is: a
+   * detect-and-gated-respond suite. Question t_527e3f35 settled the two capabilities it does NOT
+   * have — there is no pre-execution blocking on a host and there is no undo for a host change —
+   * and the answer belongs here, on the operator surface, rather than in a document. A dashboard
+   * that renders coverage, liveness and a case queue while declining to say so is implying a
+   * capability the estate does not have.
+   *
+   * Deliberately NOT tenant-scoped: a scope decision is not a tenant's, so this panel does not
+   * re-scope when the tenant switcher does, and it says so. The floor itself comes from the API's
+   * recorded capability statement; if that record cannot be read the API renders a compiled-in
+   * floor and names the absence in `unmeasured` — never silence.
+   */
+  function CapabilityPanel() {
+    var p = usePoll("/capability", 300000);
+    var d = p.state.data;
+    if (p.state.error && !d) return h(PsPanel, { title: "Capability floor", error: p.state.error });
+    if (!d) return h(PsPanel, { title: "Capability floor", sub: "loading" }, h("div", { className: "mc-muted" }, "…"));
+    var rows = d.rows || [];
+    var kindOf = { shipped: "", partial: "mc-pill-warn", out_of_scope: "mc-pill-err" };
+    return h(PsPanel, {
+      title: "Capability floor — what this suite does, and what it does NOT do",
+      sub: "a recorded SCOPE DECISION, not a measurement (" + (d.decision_card || "no card")
+        + (d.decided ? ", " + d.decided : "") + ") — this panel is estate-wide and does not re-scope "
+        + "with the tenant switcher: a scope decision is not a tenant's",
+      as_of: d.as_of, unmeasured: d.unmeasured,
+      right: h("span", { className: "mc-row-m" },
+        h(Pill, { kind: d.out_of_scope_count ? "mc-pill-err" : "" }, d.out_of_scope_count + " out of scope"),
+        h(Pill, { kind: d.partial_count ? "mc-pill-warn" : "" }, d.partial_count + " partial"),
+        h(Pill, { kind: d.provenance === "plugin" ? "" : "mc-pill-warn" },
+          "record: " + (d.provenance || "none")))
+    },
+      h("table", { className: "mc-table" },
+        h("thead", null, h("tr", null,
+          h("th", null, "capability"), h("th", null, "state"), h("th", null, "what that means"))),
+        h("tbody", null, rows.map(function (r) {
+          return h("tr", { key: r.id, className: r.state === "out_of_scope" ? "ps-stale" : "" },
+            h("td", null, h("div", null, r.capability || r.id), h("span", { className: "mc-muted" }, r.id)),
+            h("td", null,
+              h(Pill, { kind: kindOf[r.state] == null ? "mc-pill-warn" : kindOf[r.state] },
+                r.state || "unmeasured"),
+              r.promise ? h("div", { className: "mc-muted" }, r.promise) : null),
+            h("td", null,
+              h("div", null, r.statement || h("span", { className: "mc-muted" }, "unmeasured")),
+              (r.evidence || []).length
+                ? h("div", { className: "mc-muted" }, "evidence: " + (r.evidence || []).join(" · "))
+                : null));
+        }))),
+      h("div", { className: "mc-muted" }, "decision: " + (d.decision || "—")),
+      h("div", { className: "mc-muted" }, "why: " + (d.reason || "—")),
+      h("div", { className: "mc-muted" }, "contract: " + (d.contract_ref || "—")));
   }
 
   /* A small shared shell: title, the panel's own as_of, its unmeasured list, then content. */
