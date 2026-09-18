@@ -1,0 +1,14 @@
+name: protection-suite
+label: Protection Suite
+kind: standalone
+version: 1.0.0
+description: >
+  The multi-tenant security operator surface, as a web-dashboard tab. Reads the platform
+  registry, the detection catalog, the kanban ledger that carries every finding, the lake's
+  own feed liveness and the Sentinel/Defender exit measurement, and shows: a tenant switcher
+  with per-tenant health, the detection coverage matrix, the finding queue with the SOC
+  lifecycle, the retirement board with its shadow-proof state, and the cross-tenant view where
+  `_unattributed` is a row of its own. Every panel states what it cannot measure instead of
+  rendering it as a zero. Owner-side only: it registers no agent tools, no hooks and no CLI
+  commands.
+author: Hermes Smith
