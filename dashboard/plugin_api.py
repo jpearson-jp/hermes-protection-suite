@@ -883,16 +883,32 @@ def _ro(path: str) -> sqlite3.Connection:
 
 # --- findings ----------------------------------------------------------------
 
+# The card body is the READER's shape (contract §7), and TWO producers write TWO shapes. Both are
+# read here on purpose: `siem-detect.py` writes `Detection: `rule`` / `Severity:` / `Subject:` / a
+# `Detail:` block, and the PSEC filers wrote lowercase `rule:` / `severity:` / `subject:` with a
+# one-line `detail:` before kanban `t_6af9c689` fixed them AT THE PRODUCER. The cards already on the
+# boards keep the old shape and can never be re-bodied — a re-run returns the existing card on its
+# identity key and rewrites nothing — so this reader is the only place that can repair them.
+# MEASURED 2026-09-19T01:17Z through this reader: 0 of 134 `psec-gaps-detect` rows parsed a rule or a
+# subject, so every one rendered with an unmeasured rule, subject and device and could not be
+# grouped, and `_attribution()` had nothing to resolve the owning tenant from.
+#
+# Separate arms, NOT a case-insensitive version of the arms above: a `detail:` line inside the prose
+# of a NEW-shape body must not be mistaken for the new shape's `Detail:` block, nor the reverse.
 _SUBJECT_RE = re.compile(r"^\s*Subject:\s*(?P<subject>.+?)\s*$", re.M)
 _DETECTION_RE = re.compile(r"^\s*Detection:\s*`?(?P<rule>[A-Za-z0-9_.\-]+)`?\s*$", re.M)
 _SEVERITY_RE = re.compile(r"^\s*Severity:\s*(?P<sev>[a-z]+)\s*$", re.M)
+_LEGACY_RULE_RE = re.compile(r"^\s*rule:\s*`?(?P<rule>[A-Za-z0-9_.\-]+)`?\s*$", re.M)
+_LEGACY_SEVERITY_RE = re.compile(r"^\s*severity:\s*(?P<sev>[a-z]+)\s*$", re.M)
+_LEGACY_SUBJECT_RE = re.compile(r"^\s*subject:\s*(?P<subject>.+?)\s*$", re.M)
+_LEGACY_DETAIL_RE = re.compile(r"^\s*detail:\s*(?P<detail>.+?)\s*$", re.M)
 
 
 def _parse_finding(body: Optional[str]) -> dict[str, Any]:
     text = body or ""
-    rule = _DETECTION_RE.search(text)
-    sev = _SEVERITY_RE.search(text)
-    subj = _SUBJECT_RE.search(text)
+    rule = _DETECTION_RE.search(text) or _LEGACY_RULE_RE.search(text)
+    sev = _SEVERITY_RE.search(text) or _LEGACY_SEVERITY_RE.search(text)
+    subj = _SUBJECT_RE.search(text) or _LEGACY_SUBJECT_RE.search(text)
     subject = (subj.group("subject") if subj else "").strip()
     device = ""
     if subject:
@@ -908,6 +924,10 @@ def _parse_finding(body: Optional[str]) -> dict[str, Any]:
                 break
             if line:
                 detail.append(line)
+    else:
+        legacy_detail = _LEGACY_DETAIL_RE.search(text)
+        if legacy_detail:
+            detail.append(legacy_detail.group("detail").strip())
     return {
         "rule_id": rule.group("rule") if rule else None,
         "severity": sev.group("sev").lower() if sev else None,
@@ -938,10 +958,19 @@ def _read_findings() -> dict[str, Any]:
     for b in _boards():
         try:
             with closing(_ro(b["path"])) as conn:
+                # The verdict's FALLBACK source. `result` is the disposition's home (contract §7),
+                # but `kanban_complete(summary=...)` is the tooling's documented handoff and most
+                # completers use it: MEASURED 2026-09-19, 414 of 583 `done` finding cards carry
+                # their verdict ONLY in the latest run's summary. A board with no `task_runs` table
+                # (a synthetic fixture) is read the old way rather than reported unmeasured.
+                has_runs = bool(conn.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name='task_runs'").fetchone())
+                summary_arm = (", (SELECT r.summary FROM task_runs r WHERE r.task_id = tasks.id"
+                               " ORDER BY r.id DESC LIMIT 1) AS run_summary") if has_runs else ", NULL AS run_summary"
                 cur = conn.execute(
                     f"""
                     SELECT id, title, status, assignee, created_by, created_at, completed_at,
-                           block_kind, last_heartbeat_at, body, result
+                           block_kind, last_heartbeat_at, body, result{summary_arm}
                     FROM tasks
                     WHERE (created_by IN ({placeholders}) OR title LIKE 'SIEM [%' OR title LIKE 'PSEC [%')
                       AND status != 'archived'
@@ -982,7 +1011,7 @@ def _read_findings() -> dict[str, Any]:
                 "resolved_at": _iso(r["completed_at"]),
                 "age_seconds": age,
                 "stale": stale,
-                "disposition": _disposition(r["result"], r["block_kind"], soc),
+                "disposition": _disposition(r["result"], r["run_summary"], soc),
                 "mttr_seconds": ((_int_or_none(r["completed_at"]) - created)
                                  if (_int_or_none(r["completed_at"]) and created) else None),
             })
@@ -995,12 +1024,36 @@ def _read_findings() -> dict[str, Any]:
     }
 
 
-def _disposition(result: Optional[str], block_kind: Optional[str], soc: str) -> Optional[str]:
-    text = (result or "").lower()
-    if "false positive" in text or "false_positive" in text:
+def _disposition(result: Optional[str], summary: Optional[str], soc: str) -> Optional[str]:
+    """The finding's disposition — `result` is its HOME, the latest run's `summary` is read too.
+
+    Contract §7 names `tasks.result` as the disposition's home, and that stays true: a non-empty
+    `result` is read and the summary is never consulted. The summary is read only where `result` is
+    empty, because `kanban_complete(summary=...)` is the tooling's documented handoff and it is where
+    the verdict actually is — MEASURED 2026-09-19: 414 of 583 `done` finding cards carry a verdict in
+    the run summary with `result` NULL, so all 414 rendered `resolved (disposition unrecorded)`.
+    Reading the fallback repairs them with no board write.
+
+    ⛔ A verdict written into a COMMENT is still NOT a disposition: a thread is prose, not a field,
+    and reading it would make the queue depend on free text it cannot validate.
+
+    Vocabulary, in order (a summary saying "FALSE POSITIVE, benign" is a false positive):
+      * `false_positive` — the detector was wrong.
+      * `contained` — a response action bounded it.
+      * `benign` — expected, no incident, or a labelled positive control, with the detector CORRECT.
+        Its own value deliberately: folding it into `false_positive` would tell rule-tuning to retune
+        a rule that is working (MEASURED: ~400 of those 414 fallback summaries say benign/expected,
+        only 14 say "false positive" in so many words).
+    """
+    text = result if (result or "").strip() else (summary or "")
+    low = (text or "").lower()
+    if "false positive" in low or "false_positive" in low or "false-positive" in low:
         return "false_positive"
-    if "contained" in text:
+    if "contained" in low:
         return "contained"
+    if any(k in low for k in ("benign", "no incident", "not an incident", "not a security incident",
+                              "positive control")):
+        return "benign"
     if soc == "resolved":
         return "resolved (disposition unrecorded)"
     return None

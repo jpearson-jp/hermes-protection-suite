@@ -14,6 +14,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import os
+import re
 import sqlite3
 import sys
 import tempfile
@@ -57,6 +58,21 @@ def _make_board(home: Path, slug: str, rows: list[dict]) -> Path:
     conn.commit()
     conn.close()
     return db
+
+
+def _add_runs(db: Path, runs: list[dict]) -> None:
+    """A board's run history — the table the reader falls back to for a card's verdict.
+
+    Only the columns the reader's query touches: `id` (latest = highest), `task_id`, `summary`.
+    """
+    conn = sqlite3.connect(db)
+    conn.execute("create table task_runs (id integer primary key autoincrement, task_id text,"
+                 " summary text)")
+    for r in runs:
+        conn.execute("insert into task_runs (task_id, summary) values (?,?)",
+                     (r.get("task_id"), r.get("summary")))
+    conn.commit()
+    conn.close()
 
 
 def _registry_record(platform: str) -> str:
@@ -614,6 +630,118 @@ class ProtectionSuiteApi(unittest.TestCase):
         self.assertIn("capability", meta)
         self.assertEqual(meta["capability"]["provenance"], "plugin")
         self.assertGreaterEqual(meta["capability"]["out_of_scope"], 2)
+
+    # --- the card body is the READER's shape (t_91659f39) ----------------------
+
+    # The pre-`t_6af9c689` PSEC shape, verbatim from a live card (`t_0dec9ce0`).
+    LEGACY_PSEC_BODY = (
+        "rule: cloud_privileged_change\n"
+        "severity: high\n"
+        "subject: eceb0f73-329b-4515-9e7b-f11bd4c2f950\n"
+        "n: 2\n"
+        "detail: Microsoft.Authorization/roleAssignments/write by eceb0f73 on /subscriptions/048d\n"
+        "\n"
+        "Filed by psec-gaps-detect.py. Coverage-gap stream (kanban t_540ce4c5).\n"
+    )
+
+    def test_the_legacy_psec_body_is_parsed_and_the_widening_is_what_parses_it(self):
+        """152 cards already on the boards carry the old shape; the reader repairs them.
+
+        MEASURED before the widening, through this reader over the live boards: 0 of 134
+        `psec-gaps-detect` rows parsed a `rule_id` or a `subject`.
+
+        The second half is the MUTATION CONTROL: with the legacy arms disabled the SAME fixture
+        stops parsing, so the arm proves the widening and not the fixture.
+        """
+        m = _load(self.home, self.artifact)
+        got = m._parse_finding(self.LEGACY_PSEC_BODY)
+        self.assertEqual(got["rule_id"], "cloud_privileged_change")
+        self.assertEqual(got["severity"], "high")
+        self.assertEqual(got["subject"], "eceb0f73-329b-4515-9e7b-f11bd4c2f950")
+        self.assertEqual(got["device_id"], "eceb0f73-329b-4515-9e7b-f11bd4c2f950")
+        self.assertEqual(got["detail"], "Microsoft.Authorization/roleAssignments/write by eceb0f73"
+                                        " on /subscriptions/048d")
+        never = re.compile("(?!)")
+        m._LEGACY_RULE_RE = m._LEGACY_SEVERITY_RE = never
+        m._LEGACY_SUBJECT_RE = m._LEGACY_DETAIL_RE = never
+        blind = m._parse_finding(self.LEGACY_PSEC_BODY)
+        self.assertIsNone(blind["rule_id"], "reverting the widening must stop parsing the old shape")
+        self.assertIsNone(blind["subject"])
+        self.assertIsNone(blind["severity"])
+
+    def test_the_modern_shape_is_unchanged_and_a_new_body_keeps_its_detail_block(self):
+        """Both shapes are read; adding the legacy arm must not disturb the one that worked."""
+        m = _load(self.home, self.artifact)
+        body = ("Detection: `alpha_rule_a`\nSeverity: high\nSubject: device_x : HKLM\\Run\\bad\n\n"
+                "Detail:\n```\nfirst line\ndetail: a lowercase line inside the block\n```\n")
+        got = m._parse_finding(body)
+        self.assertEqual(got["rule_id"], "alpha_rule_a")
+        self.assertEqual(got["severity"], "high")
+        self.assertEqual(got["subject"], "device_x : HKLM\\Run\\bad")
+        self.assertEqual(got["device_id"], "device_x")
+        self.assertEqual(got["detail"], "first line",
+                         "the new shape's `Detail:` block wins; a `detail:` line inside it is prose")
+
+    # --- the disposition, and where it lives (t_91659f39) ----------------------
+
+    def _board_with_one_finding(self, **card) -> Path:
+        m = _make_board(self.home, "b1", [{
+            "id": "t_1", "title": "PSEC [high] cloud_privileged_change: s1", "body": self.LEGACY_PSEC_BODY,
+            "assignee": "x", "status": "done", "created_by": "psec-gaps-detect",
+            "created_at": 1_700_000_000, "completed_at": 1_700_000_500, **card}])
+        return m
+
+    def test_a_verdict_in_the_run_summary_is_read_and_result_still_wins(self):
+        """414 of 583 `done` finding cards carry their verdict ONLY in the run summary."""
+        m = _load(self.home, self.artifact)
+        db = self._board_with_one_finding()
+        _add_runs(db, [{"task_id": "t_1", "summary": "an older run"},
+                       {"task_id": "t_1", "summary": "Triage verdict: FALSE POSITIVE, no incident."}])
+        pop = m._read_findings()
+        self.assertEqual(pop["rows"][0]["disposition"], "false_positive")
+        # `result` is the disposition's HOME: a non-empty result is read and the summary ignored.
+        b1 = self.home / "kanban" / "boards" / "b1" / "kanban.db"
+        b1.unlink()
+        _make_board(self.home, "b1", [{
+            "id": "t_1", "title": "PSEC [high] x", "body": "", "assignee": "x", "status": "done",
+            "created_by": "psec-gaps-detect", "created_at": 1_700_000_000, "completed_at": 1_700_000_500,
+            "result": "contained via firewall block"}])
+        _add_runs(b1, [{"task_id": "t_1", "summary": "FALSE POSITIVE"}])
+        self.assertEqual(m._read_findings()["rows"][0]["disposition"], "contained")
+
+    def test_benign_expected_is_its_own_disposition_not_a_false_positive(self):
+        """`BENIGN / EXPECTED — no incident, detector CORRECT` is not a detector defect.
+
+        MEASURED 2026-09-19 over the 414 fallback summaries: ~400 say benign/expected, 14 say
+        `false positive`. Folding the 400 into `false_positive` would tell rule-tuning to retune a
+        rule that is working.
+        """
+        m = _load(self.home, self.artifact)
+        db = self._board_with_one_finding()
+        _add_runs(db, [{"task_id": "t_1",
+                        "summary": "VERDICT: BENIGN / EXPECTED — a true positive of a correctly-"
+                                   "designed rule, no incident."}])
+        self.assertEqual(m._read_findings()["rows"][0]["disposition"], "benign")
+        for text, want in (("FALSE POSITIVE, benign", "false_positive"),
+                           ("the write was benign, detector correct", "benign"),
+                           ("labelled positive control — no host is compromised", "benign"),
+                           ("nothing recorded here at all", "resolved (disposition unrecorded)"),
+                           ("a write", "resolved (disposition unrecorded)")):
+            self.assertEqual(m._disposition(text, None, "resolved"), want, f"result={text!r}")
+
+    def test_block_kind_is_a_park_reason_and_never_a_disposition(self):
+        """§7's `typed block kinds` half: the reader surfaces the kind, it does not decide on it.
+
+        MEASURED 2026-09-19: the only blocked finding card on the boards parks with
+        `block_kind=capability` and no verdict — mapping a park reason onto a disposition would
+        invent a meaning the enum does not carry.
+        """
+        m = _load(self.home, self.artifact)
+        self._board_with_one_finding(status="blocked", block_kind="capability")
+        row = m._read_findings()["rows"][0]
+        self.assertEqual(row["block_kind"], "capability", "the kind is still CARRIED to the page")
+        self.assertEqual(row["lifecycle"], "triaging")
+        self.assertIsNone(row["disposition"], "a park reason is not a disposition")
 
     # --- parsing -------------------------------------------------------------
     def test_worker_started_at_style_values_never_become_ages(self):
