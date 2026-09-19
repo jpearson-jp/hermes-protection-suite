@@ -71,7 +71,12 @@
         h("table", { className: "mc-table" },
           h("tbody", null,
             h("tr", null, h("td", null, "registry"), h("td", null, (m.registry || {}).root || "—"), h("td", null, ((m.registry || {}).tenants) + " tenants (" + ((m.registry || {}).provenance) + ")")),
-            h("tr", null, h("td", null, "detections"), h("td", null, (m.detections || {}).path || "—"), h("td", null, ((m.detections || {}).rules) + " rules (" + ((m.detections || {}).provenance) + ")")),
+            ((m.detections || {}).catalogs || []).map(function (c) {
+              return h("tr", { key: "cat-" + c.role },
+                h("td", null, "detections — " + c.role + " catalog"),
+                h("td", null, (c.path || "—") + " · " + (c.engine || "engine unmeasured") + " · lake " + (c.lake || "unmeasured")),
+                h("td", null, c.readable ? (c.count + " rules (" + c.provenance + ")") : "unmeasured — not zero"));
+            }),
             h("tr", null, h("td", null, "lake"), h("td", null, (m.lake || {}).root || "—"), h("td", null, ((m.lake || {}).feeds) + " feeds (" + ((m.lake || {}).provenance) + ")")),
             h("tr", null, h("td", null, "retirement"), h("td", null, (m.retirement || {}).path || "—"), h("td", null, String((m.retirement || {}).provenance))),
             h("tr", null, h("td", null, "capability"), h("td", null, (m.capability || {}).path || "—"), h("td", null, String((m.capability || {}).provenance) + " · " + ((m.capability || {}).out_of_scope == null ? "unmeasured" : (m.capability.out_of_scope + " out of scope")))),
@@ -321,6 +326,8 @@
     if (!d) return h(PsPanel, { title: "Coverage matrix", sub: "loading" }, h("div", { className: "mc-muted" }, "…"));
     var rows = d.rows || [];
     var shadow = d.shadowed || [];
+    var cats = d.catalogs || [];
+    var endp = d.endpoint_catalog || {};
     var tenantCols = [];
     rows.forEach(function (r) {
       (r.cells || []).forEach(function (c) {
@@ -329,11 +336,13 @@
     });
     return h(PsPanel, {
       title: "Coverage matrix — detections x tenants",
-      sub: d.rules_total + " rules · " + d.tenants_total + " tenant(s) · coverage is a CLAIM; what is measured here is scope, enablement, maturity and waivers",
+      sub: d.rules_total + " rules in the PLATFORM catalog · " + d.tenants_total + " tenant(s) · coverage is a CLAIM; what is measured here is scope, enablement, maturity and waivers",
       as_of: d.as_of, unmeasured: d.unmeasured,
       right: h("span", { className: "mc-row-m" },
         h(Pill, { kind: d.detections_provenance === "scripts-store" ? "" : "mc-pill-warn" },
-          "rules: " + (d.detections_provenance || "none")),
+          "platform: " + (d.detections_provenance || "unmeasured")),
+        h(Pill, { kind: endp.readable ? "mc-pill-me" : "mc-pill-warn" },
+          "endpoint catalog: " + (endp.readable ? endp.count + " rules" : "unmeasured")),
         h(Pill, { kind: shadow.length ? "mc-pill-warn" : "" },
           "shadowed: " + (d.shadowed_rules_total == null ? "unmeasured" : d.shadowed_rules_total)),
         h(Pill, { kind: Object.keys(d.declared_only || {}).length ? "mc-pill-warn" : "" },
@@ -353,9 +362,33 @@
                 h(Pill, { kind: c.state === "enabled" ? "" : (c.state === "excluded" ? "mc-pill-me" : "mc-pill-warn") },
                   c.state + (c.state !== "excluded" ? " · " + c.maturity : "")));
             }));
-        }))) : h("div", { className: "mc-muted" }, "no detection index and/or no registry — the matrix cannot be built; that is not an empty matrix"),
+        }))) : h("div", { className: "mc-muted" }, "the PLATFORM catalog (psec-detections.json) and/or the registry could not be read — the matrix cannot be built; that is not an empty matrix. Any other catalog of the suite is reported below."),
+      cats.length ? h("div", { className: "ps-catalogs" },
+        h("div", { className: "mc-row-t" }, "the suite's catalogs — " + cats.length + " NAMED catalog(s), never one substituted for the other"
+          + (d.catalogs_rules_total == null ? "" : " · " + d.catalogs_rules_total + " distinct rule id(s) between them")),
+        h("table", { className: "mc-table" },
+          h("thead", null, h("tr", null,
+            h("th", null, "catalog"), h("th", null, "its own rule ids"), h("th", null, "engine"),
+            h("th", null, "lake"))),
+          h("tbody", null, cats.map(function (c) {
+            return h("tr", { key: c.role, className: c.readable ? "" : "ps-stale" },
+              h("td", null,
+                h(Pill, { kind: c.readable ? (c.role === "platform" ? "" : "mc-pill-me") : "mc-pill-warn" }, c.role),
+                h("div", { className: "mc-muted" }, c.name || ""),
+                h("div", { className: "mc-muted" }, (c.path || "—") + " (" + (c.provenance || "none") + ")")),
+              h("td", null,
+                c.readable
+                  ? h("div", null,
+                      h("span", null, c.count + " rule(s)"),
+                      h("div", { className: "mc-muted" }, (c.rules || []).join(", ")))
+                  : h(Pill, { kind: "mc-pill-warn" }, "unmeasured — not zero")),
+              h("td", { className: "mc-muted" }, c.engine || "unmeasured"),
+              h("td", { className: "mc-muted" },
+                (c.lake || "unmeasured") + (c.lake_source ? " · " + c.lake_source : "")));
+          }))),
+        h("div", { className: "mc-muted" }, d.comparability || "")) : null,
       shadow.length ? h("div", { className: "mc-err" },
-        "shadowed — live catalogs this matrix does NOT resolve, so their rules are neither listed above nor zero: " +
+        "shadowed — a LIVE catalog that is NEITHER of the suite's named catalogs, so its rules are neither listed above nor zero: " +
         shadow.map(function (s) {
           return s.rules.length + " rule(s) in " + s.path + " (" + s.provenance + "): " + s.rules.join(", ");
         }).join(" · ")) : null);

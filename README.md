@@ -133,16 +133,22 @@ programme has also called that proof `sentinel.shadow.7d`, so both are read (as 
 `proof.key` echoes the key that answered. Without the alias a producer writing the obvious key left
 the item `unproven` forever, silently.
 
-## Sources (each resolved in order; the one used is reported)
+## Sources (each source is NAMED; a source that is absent is reported, never guessed at)
 
 | source | frozen home | fallback while the producers are in flight |
 |---|---|---|
 | tenant registry | `~/.hermes/scripts/platform-registry/*.yaml` | the foundation card's artifact dir, labelled `wip-outbox` |
-| detection catalog | `~/.hermes/scripts/psec-detections.json` | `siem-detections.json`, labelled `legacy-live` — and when the frozen index IS resolved, BOTH are still read: the other one is reported as `shadowed` (file, provenance, every rule id) on `/coverage` and `/meta`, because resolving one index must never turn a second LIVE index into a silence |
+| detection catalogs — **two NAMED catalogs**, never one resolved in candidate order | **platform catalog** `~/.hermes/scripts/psec-detections.json` (contract §5's index; `rules` is a DICT; engine `psec-gaps-detect.py` — cron `8065d45ca251`, every 15 min — + `psec-detect.py`; lake `psec-sources.json` → `lake_root`) and **endpoint catalog** `~/.hermes/scripts/siem-detections.json` (the suite's second named index; `rules` is a LIST; engine `siem-detect.py` — cron `f1ed861d4b6f`, **every 5 min**, `file_cards: true`; lake `siem-lake-sources.json` → `lake_root`, stream `rmm-edr`) | **none — there is no fallback.** An absent or unreadable platform index is `unmeasured` **for platform detection**, named as such: the endpoint catalog is a different engine on a different lake and is never its substitute (ruling `t_0e78bcf9` §1.5). A genuine THIRD live catalog (`*detections*.json` that is neither named catalog) is still reported as `shadowed` with every rule id. `siem-detections-la.json` is the LA lane's **staging** file (46 KQL rules, no cron) and is in no census |
 | lake | `~/.hermes/scripts/psec-sources.json` → `lake_root` | `siem-lake-sources.json`, labelled `legacy-live` (its schema is the predecessor's, so stream-level panels stay `unmeasured`) |
 | retirement | `azure-posture.json` in the scripts store | the exit measurement's artifact dir, labelled `wip-outbox` |
 | capability floor | `dashboard/capability.json`, shipped inside this plugin and versioned with it | the compiled-in floor in `plugin_api.py`, labelled `compiled-in`, which names the same gaps |
 | ledger | the kanban boards, via `kanban_db.list_boards()` | — |
+
+`/coverage` returns both catalogs (`catalogs`, `platform_catalog`, `endpoint_catalog`) beside the
+matrix, with `catalogs_rules_total` = the distinct rule ids across both and `comparability` stating
+that the two are **not** comparable rule-for-rule. `rules_total` is the **platform** catalog only —
+the matrix is that index's, and the response's `unmeasured` names it as such so the matrix is never
+read as the estate's whole detection coverage.
 
 DuckDB is **not** importable in the dashboard's venv, so the lake probe runs in the lake venv
 (`/home/hermes/.lakevenv/bin/python3`) as a subprocess and reports a probe that fails to run as

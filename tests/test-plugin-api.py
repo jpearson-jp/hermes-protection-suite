@@ -315,9 +315,11 @@ class ProtectionSuiteApi(unittest.TestCase):
         self.assertTrue(any("proof key" in u for u in r["unmeasured"]),
                         "the key contract is named when the gate artifact is read")
 
-    # --- detections catalog ---------------------------------------------------
+    # --- detections catalogs (two NAMED catalogs, never one substituted for the other) ---------
 
-    PSEC_THREE = {
+    # The PLATFORM catalog's shape and its four live rule ids (contract §5's index; `rules` is a
+    # DICT). MEASURED 2026-09-18 on the installed blob.
+    PSEC_FOUR = {
         "_comment": ["fixture"],
         "rules": {
             "identity_signin_failure_burst": {"stream": "auth_events", "maturity": "enforcing",
@@ -326,21 +328,34 @@ class ProtectionSuiteApi(unittest.TestCase):
                                         "suppression_key": ["subject"]},
             "device_auth_failure_burst": {"stream": "auth_events", "maturity": "enforcing",
                                           "suppression_key": ["subject"]},
+            # the `view`-dialect rule (t_0f80e9ed): the frozen interface's own `events` /
+            # `tenant_params` relations, not the `{rel}` substitution.
+            "agent_endpoint_broken": {"stream": "endpoint_metrics", "maturity": "enforcing",
+                                      "suppression_key": ["subject"]},
         },
     }
-    # The eight live `edr.*` ids, read off the installed siem-detections.json (its container shape
-    # is a LIST, the frozen index's is a DICT — the reader must take both).
+    # The ENDPOINT catalog's shape: `rules` is a LIST with inline SQL (its container shape is NOT
+    # the platform index's — the reader must take both). These are the eight `edr.*` ids the ruling
+    # (t_0e78bcf9) counts as the `R` side for the MDE class; the LIVE blob gained three
+    # `edr.linux_*` rules at 13:51Z (commit 848b146) and is therefore 11 today. The fixture pins the
+    # RULING's shape, and `test_the_endpoint_count_is_measured_not_hardcoded` pins the real
+    # requirement: the panel counts whatever the blob holds.
     EDR_EIGHT = ["edr.agent_local_detection", "edr.lolbin_process", "edr.encoded_command",
                  "edr.run_key_persistence", "edr.defender_tamper", "edr.dns_tunnel",
                  "edr.script_host_spawn", "edr.device_silent"]
 
-    def _write_catalogs(self, psec=None, siem=None) -> None:
+    def _write_catalogs(self, psec=None, siem=None, psec_lake="/mnt/lake-platform",
+                        siem_lake="/home/hermes/siem-lake") -> None:
         d = self.home / "scripts"
         d.mkdir(parents=True, exist_ok=True)
         for name, payload in (("psec-detections.json", psec), ("siem-detections.json", siem)):
             if payload is None:
                 continue
             (d / name).write_text(payload if isinstance(payload, str) else json.dumps(payload))
+        if psec_lake:
+            (d / "psec-sources.json").write_text(json.dumps({"lake_root": psec_lake}))
+        if siem_lake:
+            (d / "siem-lake-sources.json").write_text(json.dumps({"lake_root": siem_lake}))
 
     @staticmethod
     def _siem_eight() -> dict:
@@ -349,81 +364,207 @@ class ProtectionSuiteApi(unittest.TestCase):
                            "suppression_key": "subject", "sql": "SELECT 1"} for n in
                           ProtectionSuiteApi.EDR_EIGHT]}
 
-    def test_both_catalogs_present_shadows_are_named_not_dropped(self):
-        """The defect: the frozen §5 index is resolved, and the eight LIVE `edr.*` rules vanish.
+    def test_two_named_catalogs_each_with_its_own_rule_ids(self):
+        """THE ACCEPTANCE: platform 4 + endpoint 8, each NAMED with its provenance, union readable
+        as 12, and no rule id in both.
 
-        First-readable-candidate is the right resolution order, but a second catalog that a cron
-        job reads every five minutes is not thereby unread — and it is certainly not zero. It is
-        SHADOWED, and the panel must be able to say so.
+        The endpoint catalog is a SECOND NAMED CATALOG of the suite (ruling t_0e78bcf9 §1.5), read
+        by siem-detect.py every 5 minutes against the endpoint lake — not a `legacy` fallback and
+        not a `shadowed` name-list.
         """
         m = _load(self.home, self.artifact)
-        self._write_catalogs(psec=self.PSEC_THREE, siem=self._siem_eight())
+        self._write_catalogs(psec=self.PSEC_FOUR, siem=self._siem_eight())
         d = m._detections()
-        self.assertEqual(d["provenance"], "scripts-store",
-                         "the frozen §5 index is still the resolved catalog")
-        self.assertEqual(sorted(r["rule"] for r in d["rules"]), sorted(self.PSEC_THREE["rules"]))
-        self.assertEqual(len(d["shadowed"]), 1, f"the second catalog is a shadow: {d['shadowed']}")
-        s = d["shadowed"][0]
-        self.assertTrue(s["path"].endswith("siem-detections.json"))
-        self.assertEqual(s["provenance"], "legacy-live")
-        self.assertEqual(s["count"], 8)
-        self.assertEqual(sorted(s["rules"]), sorted(self.EDR_EIGHT))
-        note = [u for u in d["unmeasured"] if "SHADOWED" in u]
-        self.assertTrue(note, f"a shadow must be an unmeasured entry, never a silence: {d['unmeasured']}")
-        for rid in self.EDR_EIGHT:
-            self.assertIn(rid, note[0], "every shadowed rule id is named, not summarised away")
+
+        plat, endp = d["platform_catalog"], d["endpoint_catalog"]
+        self.assertEqual(plat["role"], "platform")
+        self.assertEqual(endp["role"], "endpoint")
+        self.assertEqual(plat["count"], 4, f"the platform catalog is 4 rules: {plat}")
+        self.assertEqual(sorted(plat["rules"]), sorted(self.PSEC_FOUR["rules"]))
+        self.assertEqual(endp["count"], 8, f"the endpoint catalog is 8 rules: {endp}")
+        self.assertEqual(sorted(endp["rules"]), sorted(self.EDR_EIGHT))
+
+        # Provenance is NAMED for each: which store, which engine, which lake, from which config.
+        self.assertEqual(plat["provenance"], "scripts-store")
+        self.assertEqual(endp["provenance"], "live-endpoint")
+        self.assertIn("siem-detect.py", endp["engine"])
+        self.assertIn("every 5 min", endp["engine"])
+        self.assertIn("psec-gaps-detect.py", plat["engine"])
+        self.assertEqual(plat["lake"], "/mnt/lake-platform")
+        self.assertEqual(plat["lake_source"], str(self.home / "scripts" / "psec-sources.json"))
+        self.assertEqual(endp["lake"], "/home/hermes/siem-lake")
+        self.assertEqual(endp["lake_source"],
+                         str(self.home / "scripts" / "siem-lake-sources.json"))
+        self.assertTrue(plat["readable"] and endp["readable"])
+
+        # The endpoint ids are NEVER folded into the platform index's resolved rule list...
+        self.assertEqual(sorted(r["rule"] for r in d["rules"]), sorted(self.PSEC_FOUR["rules"]))
         self.assertFalse([r for r in d["rules"] if r["rule"] in self.EDR_EIGHT],
-                         "a shadowed rule must not be silently folded into the resolved catalog")
+                         "an endpoint rule must never be recorded as a platform-index rule")
+        # ...and the union is readable as 12, with nothing counted twice.
+        self.assertEqual(d["catalogs_rules_total"], 12)
+        self.assertEqual(d["rule_ids_shared"], [])
+        self.assertEqual(d["catalogs"], [plat, endp])
+        self.assertIn("NOT comparable rule-for-rule", d["comparability"])
 
-    def test_only_the_predecessor_present_is_labelled_legacy_and_shadows_nothing(self):
+    def test_the_endpoint_count_is_measured_not_hardcoded(self):
+        """The panel counts what the blob HOLDS. The live blob grew 8 -> 11 at 13:51Z (848b146); a
+        panel that reported 8 because the ruling said eight would be wrong the same day it shipped.
+        """
         m = _load(self.home, self.artifact)
-        self._write_catalogs(siem=self._siem_eight())
+        nine = dict(self._siem_eight())
+        nine["rules"] = list(self._siem_eight()["rules"]) + [
+            {"name": "edr.linux_exec_from_shm", "title": "x", "severity": "high",
+             "window_min": 30, "suppression_key": "subject", "sql": "SELECT 1"}]
+        self._write_catalogs(psec=self.PSEC_FOUR, siem=nine)
         d = m._detections()
-        self.assertEqual(d["provenance"], "legacy-live")
-        self.assertEqual(len(d["rules"]), 8)
-        self.assertTrue(all(r["maturity"] == "unmeasured" for r in d["rules"]),
-                        "the predecessor carries no maturity field — that is unmeasured, not enforcing")
-        self.assertEqual(d["shadowed"], [])
-        self.assertTrue(any("is not installed" in u for u in d["unmeasured"]))
+        self.assertEqual(d["endpoint_catalog"]["count"], 9)
+        self.assertEqual(d["catalogs_rules_total"], 13)
 
-    def test_a_broken_frozen_index_names_the_live_predecessors_rules_not_zero(self):
-        """A read failure of the FIRST candidate must not render the estate as having no rules."""
+    def test_an_absent_platform_index_is_unmeasured_and_the_endpoint_is_not_its_substitute(self):
+        """THE CONTROL (ruling §1.5): the old reader resolved the first readable candidate and fell
+        back to siem-detections.json labelled `legacy`, so eight endpoint rules rendered as THE
+        platform index. Under the ruling that is wrong: an absent platform index is UNMEASURED for
+        platform detection, named as such, and the endpoint catalog stays its own entry.
+        """
+        m = _load(self.home, self.artifact)
+        self._write_catalogs(siem=self._siem_eight())      # psec-detections.json ABSENT
+        d = m._detections()
+        self.assertEqual(d["rules"], [], "eight endpoint rules are NOT the platform index's rules")
+        self.assertEqual(d["rules_total"], 0)
+        self.assertIsNone(d["provenance"], "an absent platform index has no provenance to report")
+        self.assertIsNone(d["kind"])
+        self.assertFalse(d["platform_catalog"]["readable"])
+        self.assertFalse(d["platform_catalog"]["present"])
+        self.assertEqual(d["platform_catalog"]["count"], 0)
+        note = [u for u in d["unmeasured"] if "PLATFORM DETECTION IS UNMEASURED" in u]
+        self.assertTrue(note, f"the absence must be named: {d['unmeasured']}")
+        self.assertIn(str(self.home / "scripts" / "psec-detections.json"), note[0])
+        self.assertTrue(any("NOT covered by the endpoint catalog" in u for u in d["unmeasured"]),
+                        "the substitution refusal must be stated, not implied")
+        # ...and the endpoint catalog is still reported AS ITSELF.
+        self.assertEqual(d["endpoint_catalog"]["readable"], True)
+        self.assertEqual(d["endpoint_catalog"]["count"], 8)
+        self.assertEqual(sorted(d["endpoint_catalog"]["rules"]), sorted(self.EDR_EIGHT))
+        self.assertEqual(d["catalogs_rules_total"], 8)
+
+    def test_an_unreadable_platform_index_is_unmeasured_not_a_platform_zero(self):
+        """'Could not read' must not render as 'no platform rules', nor as eight others' rules."""
         m = _load(self.home, self.artifact)
         self._write_catalogs(psec="{ this is not json", siem=self._siem_eight())
         d = m._detections()
         self.assertEqual(d["rules"], [])
+        self.assertEqual(d["endpoint_catalog"]["count"], 8)
+        self.assertTrue(d["platform_catalog"]["present"])
+        self.assertFalse(d["platform_catalog"]["readable"])
         self.assertTrue(d["errors"], "the read failure names itself")
-        self.assertEqual(len(d["shadowed"]), 1)
-        self.assertEqual(d["shadowed"][0]["count"], 8)
-        self.assertTrue(any("unreadable" in u for u in d["unmeasured"]))
-        self.assertTrue(any("SHADOWED" in u for u in d["unmeasured"]),
-                        "the live rules are still named while the frozen index is unreadable")
+        self.assertTrue(any("PLATFORM DETECTION IS UNMEASURED" in u for u in d["unmeasured"]),
+                        d["unmeasured"])
+        self.assertTrue(any("present but UNREADABLE" in u for u in d["unmeasured"]), d["unmeasured"])
+
+    def test_a_genuine_third_catalog_is_shadowed(self):
+        """The `shadowed` mechanism survives for a THIRD live catalog — one that is neither of the
+        two named ones. Its ids are named, and it is never folded into either catalog."""
+        m = _load(self.home, self.artifact)
+        self._write_catalogs(psec=self.PSEC_FOUR, siem=self._siem_eight())
+        third = {"rules": [{"name": "opl.something", "title": "x", "stream": "auth_events"}]}
+        (self.home / "scripts" / "opl-detections.json").write_text(json.dumps(third))
+        d = m._detections()
+        self.assertEqual(d["platform_catalog"]["count"], 4)
+        self.assertEqual(d["endpoint_catalog"]["count"], 8)
+        self.assertEqual(len(d["shadowed"]), 1, f"a third live catalog is a shadow: {d['shadowed']}")
+        s = d["shadowed"][0]
+        self.assertTrue(s["path"].endswith("opl-detections.json"))
+        self.assertEqual(s["kind"], "shadowed")
+        self.assertEqual(s["rules"], ["opl.something"])
+        self.assertTrue(any("SHADOWED" in u for u in d["unmeasured"]), d["unmeasured"])
+        self.assertEqual(d["catalogs_rules_total"], 12, "a shadowed catalog is not counted as one of "
+                                                        "the suite's catalogs")
+
+    def test_the_staging_file_is_in_no_census_and_not_a_shadow(self):
+        """siem-detections-la.json is the LA lane's STAGING file (46 KQL rules, no cron): not a
+        catalog of the suite (ruling §1.6). It is counted by nothing and reported as nothing — and it
+        is NOT a `shadowed` entry either, which would claim a live catalog this panel is declining
+        to resolve."""
+        m = _load(self.home, self.artifact)
+        self._write_catalogs(psec=self.PSEC_FOUR, siem=self._siem_eight())
+        la = {"file_cards": False, "rules": [{"name": f"theone-rule-{i}", "title": "x",
+                                              "kql": "dependencies | take 1"} for i in range(46)]}
+        (self.home / "scripts" / "siem-detections-la.json").write_text(json.dumps(la))
+        d = m._detections()
+        self.assertEqual(d["shadowed"], [], "the staging file is not a shadowed live catalog")
+        self.assertEqual(d["catalogs_rules_total"], 12)
+        self.assertEqual([c["role"] for c in d["catalogs"]], ["platform", "endpoint"])
+        self.assertEqual(sum(c["count"] for c in d["catalogs"]), 12, "46 is in no census")
+        self.assertFalse([u for u in d["unmeasured"] if "siem-detections-la" in u and "excluded" not in u
+                          and "staging" not in u.lower() and "not a catalog" not in u.lower()],
+                         f"the staging file may only be mentioned as excluded: {d['unmeasured']}")
 
     def test_the_reader_accepts_both_container_shapes(self):
-        """MEASURED: the frozen index is `rules: {id: {...}}`, the predecessor `rules: [{name: …}]`.
+        """MEASURED: the platform index is `rules: {id: {...}}`, the endpoint catalog `rules: [{name: …}]`.
 
-        Neither shape may be read as empty — that is the same defect as the shadow, one layer down.
+        Neither shape may be read as empty — that is the same defect as the substitution, one layer
+        down.
         """
         m = _load(self.home, self.artifact)
-        self._write_catalogs(psec=self.PSEC_THREE)
+        self._write_catalogs(psec=self.PSEC_FOUR)
         dict_shaped = m._detections()
-        self.assertEqual(len(dict_shaped["rules"]), 3)
+        self.assertEqual(dict_shaped["platform_catalog"]["count"], 4)
         self._write_catalogs(psec={"rules": [{"name": r, "title": r, "stream": "cloud_audit"}
-                                             for r in self.PSEC_THREE["rules"]]})
+                                             for r in self.PSEC_FOUR["rules"]]})
         m2 = _load(self.home, self.artifact)
         list_shaped = m2._detections()
-        self.assertEqual(len(list_shaped["rules"]), 3)
+        self.assertEqual(list_shaped["platform_catalog"]["count"], 4)
         self.assertEqual(sorted(r["rule"] for r in dict_shaped["rules"]),
                          sorted(r["rule"] for r in list_shaped["rules"]))
         self.assertEqual(sorted(dict_shaped["rules"][0].keys()), sorted(list_shaped["rules"][0].keys()),
                          "both shapes normalise to the same record")
 
-    def test_both_catalogs_absent_is_unknown_not_zero(self):
+    def test_no_catalog_at_all_is_unknown_not_zero(self):
         m = _load(self.home, self.artifact)
         d = m._detections()
         self.assertEqual(d["rules"], [])
         self.assertEqual(d["shadowed"], [])
-        self.assertTrue(any("unknown, not zero" in u for u in d["unmeasured"]), d["unmeasured"])
+        self.assertEqual(d["catalogs_rules_total"], 0)
+        self.assertEqual([c["readable"] for c in d["catalogs"]], [False, False])
+        self.assertTrue(any("ABSENT" in u for u in d["unmeasured"]), d["unmeasured"])
+        self.assertTrue(any("UNMEASURED, not zero" in u for u in d["unmeasured"]), d["unmeasured"])
+        self.assertNotIn("legacy", json.dumps(d).lower(),
+                         "no catalog is called `legacy` any more: they are two named catalogs")
+
+    def test_coverage_returns_the_endpoint_catalog_beside_the_matrix(self):
+        """The matrix is the platform catalog's; the panel says so, and carries the endpoint
+        catalog's own entry, engine, lake and count beside it."""
+        m = _load(self.home, self.artifact)
+        (self.home / "scripts" / "platform-registry").mkdir(parents=True, exist_ok=True)
+        (self.home / "scripts" / "platform-registry" / "alpha.json").write_text(
+            _registry_record("alpha"))
+        self._write_catalogs(psec=self.PSEC_FOUR, siem=self._siem_eight())
+        out = m.coverage(tenant="all")
+        self.assertEqual(out["rules_total"], 4, "rules_total is the platform catalog")
+        self.assertEqual(out["platform_catalog"]["count"], 4)
+        self.assertEqual(out["endpoint_catalog"]["count"], 8)
+        self.assertEqual(out["endpoint_catalog"]["lake"], "/home/hermes/siem-lake")
+        self.assertEqual(out["catalogs_rules_total"], 12)
+        self.assertIn("NOT comparable rule-for-rule", out["comparability"])
+        note = [u for u in out["unmeasured"] if "counts the PLATFORM catalog only" in u]
+        self.assertTrue(note, f"the matrix's scope must be named: {out['unmeasured']}")
+        self.assertIn("8 rule(s)", note[0])
+        self.assertIn("12 distinct rule id(s)", note[0])
+        self.assertFalse([r for r in out["rows"] if r["rule"] in self.EDR_EIGHT],
+                         "an endpoint rule must never appear in the platform matrix")
+
+    def test_meta_carries_both_catalogs(self):
+        m = _load(self.home, self.artifact)
+        self._write_catalogs(psec=self.PSEC_FOUR, siem=self._siem_eight())
+        meta = m.meta()
+        cats = meta["detections"]["catalogs"]
+        self.assertEqual([c["role"] for c in cats], ["platform", "endpoint"])
+        self.assertEqual([c["count"] for c in cats], [4, 8])
+        self.assertEqual(meta["detections"]["catalogs_rules_total"], 12)
+        self.assertEqual(meta["detections"]["rules"], 4, "the headline count is the platform index's")
+        self.assertIn("siem-detect.py", cats[1]["engine"])
+        self.assertEqual(cats[1]["lake"], "/home/hermes/siem-lake")
 
     # --- the capability floor (t_527e3f35) ------------------------------------
 

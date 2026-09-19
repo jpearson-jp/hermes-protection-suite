@@ -21,15 +21,27 @@ this card ``t_4806df6b``). Design is frozen by
   Mission Control's Waiting-on-me tab; these routes exist for the automation tiers and for a
   tenant-scoped answer, and are not a second inbox (04 §3.4 rule 4).
 
-Sources, in the order each is resolved (a source that is absent is reported, never guessed):
+Sources, each with its own name (a source that is absent is reported, never guessed):
 
     registry      <hermes home>/scripts/platform-registry/*.yaml|*.json   (frozen, contract §3)
                   fallback: the foundation card's own artifact dir, labelled ``wip-outbox``
-    detections    <hermes home>/scripts/psec-detections.json               (frozen, contract §5)
-                  fallback: siem-detections.json — the live predecessor, labelled ``legacy``
-                  AND: every OTHER live catalog is reported as ``shadowed`` (its file, its
-                  provenance, its rule ids), because resolving one index must never turn a
-                  second live one into a silence — see ``_shadow_report``
+    detections    TWO CATALOGS OF RECORD, read by two engines against two lakes (contract §5, as
+                  amended by the ruling on ``t_0e78bcf9``). They are NAMED, never resolved in
+                  candidate order:
+                    platform catalog  <hermes home>/scripts/psec-detections.json  (the frozen §5
+                                      index) — engine ``psec-gaps-detect.py`` (cron 8065d45ca251,
+                                      every 15 min) + ``psec-detect.py``; lake from
+                                      ``psec-sources.json`` -> ``lake_root``
+                    endpoint catalog  <hermes home>/scripts/siem-detections.json — the suite's
+                                      SECOND NAMED INDEX: engine ``siem-detect.py`` (cron
+                                      f1ed861d4b6f, EVERY 5 MIN, ``file_cards: true``); lake from
+                                      ``siem-lake-sources.json`` -> ``lake_root``, stream ``rmm-edr``
+                  ⛔ An absent or unreadable platform index is **UNMEASURED for platform
+                  detection**, named as such. The endpoint catalog is a different engine on a
+                  different lake and is NEVER its substitute. A genuine THIRD live catalog is
+                  still reported as ``shadowed`` (file + every rule id) — see ``_shadow_report``;
+                  ``siem-detections-la.json`` is the LA lane's STAGING file and is in no census at
+                  all (see ``STAGING_CATALOGS``).
     lake          <hermes home>/scripts/psec-sources.json -> lake_root      (frozen, contract §1)
                   the existing endpoint feed (siem-lake-sources.json) is read as a ``legacy``
                   feed with its own schema, labelled as such
@@ -391,16 +403,75 @@ def _states_or_refuse(state: Optional[str]) -> set[str]:
     return wanted
 
 
-# --- detections catalog ------------------------------------------------------
+# --- detections catalogs -----------------------------------------------------
+#
+# THE SUITE HAS TWO CATALOGS OF RECORD, and they are NAMED — never resolved in candidate order
+# (contract §5, as amended by the ruling on t_0e78bcf9). Each is read by its OWN engine against its
+# OWN lake, and this panel renders BOTH. Neither is a predecessor of the other; neither is "legacy".
+#
+#   1. PLATFORM catalog — ``psec-detections.json``, the frozen §5 index. ``rules`` is a DICT
+#      ({id: {...}}). Read by ``psec-gaps-detect.py`` (cron 8065d45ca251, every 15 min) and
+#      ``psec-detect.py``, against the PLATFORM lake (``psec-sources.json`` -> ``lake_root``).
+#   2. ENDPOINT catalog — ``siem-detections.json``, the suite's SECOND NAMED INDEX. ``rules`` is a
+#      LIST with inline SQL and ``window_min``. Read by ``siem-detect.py`` from cron
+#      ``f1ed861d4b6f`` EVERY 5 MINUTES with ``file_cards: true``, against the ENDPOINT lake
+#      (``siem-lake-sources.json`` -> ``lake_root``, stream ``rmm-edr``).
+#
+# ⛔ THE ENDPOINT CATALOG IS NEVER A SUBSTITUTE FOR THE PLATFORM ONE. MEASURED 2026-09-18: the
+# previous reader resolved the FIRST READABLE candidate and labelled the endpoint catalog
+# ``legacy``, so its rules — a different engine, a different lake, a different rule shape —
+# rendered as THE platform index whenever ``psec-detections.json`` was absent or unreadable. Under
+# the ruling an absent platform index is **UNMEASURED for platform detection** and must say so by
+# name, because a rule that runs somewhere else is not a measurement of the index that is missing.
 
-DETECTION_CANDIDATES = (
-    ("psec-detections.json", "scripts-store", "psec"),
-    ("siem-detections.json", "legacy-live", "legacy"),
+PLATFORM_CATALOG_FILE = "psec-detections.json"
+ENDPOINT_CATALOG_FILE = "siem-detections.json"
+PLATFORM_LAKE_CONFIG = "psec-sources.json"
+ENDPOINT_LAKE_CONFIG = "siem-lake-sources.json"
+
+PLATFORM_CATALOG_PROVENANCE = "scripts-store"
+ENDPOINT_CATALOG_PROVENANCE = "live-endpoint"
+
+PLATFORM_CATALOG_ENGINE = "psec-gaps-detect.py (cron 8065d45ca251, every 15 min) + psec-detect.py"
+ENDPOINT_CATALOG_ENGINE = "siem-detect.py (cron f1ed861d4b6f, every 5 min, file_cards: true)"
+
+COMPARABILITY = (
+    "each catalog is read by its own engine against its own lake, with its own rule shape "
+    "(platform: `rules` is a DICT, `{rel}`/`view` SQL over the platform lake; endpoint: `rules` is "
+    "a LIST, inline SQL over the endpoint lake). The two are NOT comparable rule-for-rule — only "
+    "their rule IDS are counted together, as the two catalogs of one suite."
 )
 
+# NOT a catalog of the suite (ruling §1.6): the LA lane's STAGING file — 46 KQL-dialect rules, NO
+# cron job, read only via `siem-detect.py --rules`. A rule is promoted out of it into
+# siem-detections.json once its hits have been read on real rows. It is excluded from the census BY
+# NAME so no future reader counts 46 + the endpoint catalog as the estate's detection coverage — and
+# it is deliberately NOT rendered as a ``shadowed`` entry either, because ``shadowed`` says "this
+# catalog is live and this panel is not resolving it", which would be a false claim about a file
+# nothing schedules.
+STAGING_CATALOGS = ("siem-detections-la.json",)
 
-def _catalog_rule_ids(data: Any) -> list[str]:
-    """The rule ids a catalog holds, in EITHER container shape.
+# The catalog files this panel knows BY NAME. Anything else in the scripts store matching
+# ``*detections*.json`` — and not a STAGING file — is a genuine THIRD catalog and is reported,
+# never silenced (see ``_shadow_report``).
+KNOWN_CATALOG_FILES = (PLATFORM_CATALOG_FILE, ENDPOINT_CATALOG_FILE)
+
+
+def _rule_record(name: str, r: dict[str, Any]) -> dict[str, Any]:
+    """One rule, normalised to the fields the matrix and the catalog entries read."""
+    return {
+        "rule": name,
+        "title": r.get("title") or "",
+        "severity": r.get("severity") or "",
+        "stream": r.get("stream") or "",
+        "platforms": r.get("platforms") or "all",
+        "maturity": r.get("maturity") or "",
+        "suppression_key": r.get("suppression_key") or "",
+    }
+
+
+def _catalog_rules(data: Any) -> list[dict[str, Any]]:
+    """The rules a catalog holds, in EITHER container shape.
 
     MEASURED 2026-09-18: the two live catalogs differ in shape — ``psec-detections.json`` is
     ``rules: {id: {...}}`` and ``siem-detections.json`` is ``rules: [{name: …}, …]``. A reader
@@ -408,34 +479,133 @@ def _catalog_rule_ids(data: Any) -> list[str]:
     zero's clothes. Both shapes are therefore read here, and neither is guessed at.
     """
     raw = data.get("rules") if isinstance(data, dict) else None
+    out: list[dict[str, Any]] = []
     if isinstance(raw, list):
-        return [str(r.get("name") or r.get("rule")) for r in raw
-                if isinstance(r, dict) and (r.get("name") or r.get("rule"))]
-    if isinstance(raw, dict):
-        return [str(k) for k in raw]
-    return []
+        for r in raw:
+            if not isinstance(r, dict):
+                continue
+            name = r.get("name") or r.get("rule")
+            if name:
+                out.append(_rule_record(str(name), r))
+    elif isinstance(raw, dict):
+        for name, r in raw.items():
+            if isinstance(r, dict):
+                out.append(_rule_record(str(name), r))
+    return out
 
 
-def _shadow_report(chosen: Optional[Path], resolved_ids: set[str]) -> tuple[list[dict], list[str]]:
-    """Every OTHER live detection catalog on this host, as a SHADOW entry — never a silence.
+def _catalog_rule_ids(data: Any) -> list[str]:
+    """The rule ids a catalog holds, in either container shape (see ``_catalog_rules``)."""
+    return [r["rule"] for r in _catalog_rules(data)]
 
-    Resolving the first readable candidate is how the frozen §5 index is preferred. It must not
-    ALSO mean that a second catalog which is LIVE becomes invisible. MEASURED 2026-09-18 on this
-    host: ``siem-detections.json`` is read by ``siem-detect.py`` every 5 minutes (cron job
-    f1ed861d4b6f, ``file_cards: true``) and carries eight calibrated ``edr.*`` rules that are
-    DISJOINT from the three in the frozen index. With only the first-candidate rule, the coverage
-    panel reported three rules as the estate's whole detection coverage with NO ``unmeasured``
-    entry at all — a failed measurement rendered as a complete one, which is the principle this
-    module's docstring states.
 
-    A shadowed catalog is named here (file, provenance, ids); it is distinguished from an ABSENT
-    one (nothing said) and from an UNREADABLE one (its own note, and it is still not zero).
+def _catalog_lake(config_name: str, role: str) -> tuple[Optional[str], Optional[str], list[str]]:
+    """The lake a catalog is read against, from the ONE config key that lake has (§1, §4).
+
+    Read from the catalog's OWN config file, never inferred from the other lake: the platform root
+    and the endpoint root are two different roots, and a panel that showed one catalog a lake it is
+    not read against would be comparing two engines' lakes — the defect this module removes, one
+    layer up.
+    """
+    path = _scripts_dir() / config_name
+    data, err = _read_json(path)
+    if err:
+        return None, str(path), [
+            f"detections: the {role} lake config {path} is unreadable ({err}) — the {role} "
+            "catalog's lake is unmeasured"]
+    if isinstance(data, dict) and data.get("lake_root"):
+        return str(data["lake_root"]), str(path), []
+    return None, str(path), [
+        f"detections: no `lake_root` in {path} — the {role} catalog's lake is unmeasured"]
+
+
+def _catalog_entry(path: Path, *, role: str, name: str, provenance: str, engine: str,
+                   lake: Optional[str], lake_source: Optional[str]) -> dict[str, Any]:
+    """One NAMED catalog: what it is, what reads it, the lake it is read against, its own rule ids.
+
+    ``present`` and ``readable`` are separate on purpose: a catalog that exists but cannot be parsed
+    is a FAILED measurement (its rules are unmeasured), while one that does not exist is an ABSENCE
+    — and neither is a zero. ``rule_records`` is the internal carrier of the full records; only the
+    platform catalog's are kept by ``_detections`` (the matrix is the platform catalog's, and the
+    endpoint catalog is rendered by its ids — see ``COMPARABILITY``).
+    """
+    entry: dict[str, Any] = {
+        "role": role,
+        "name": name,
+        "path": str(path),
+        "provenance": provenance,
+        "engine": engine,
+        "lake": lake,
+        "lake_source": lake_source,
+        "present": path.exists(),
+        "readable": False,
+        "count": 0,
+        "rules": [],
+        "errors": [],
+        "unmeasured": [],
+    }
+    data, err = _read_json(path)
+    if err:
+        entry["errors"].append(err)
+        entry["unmeasured"].append(
+            f"detections: the {role} catalog {path} is present but UNREADABLE ({err}) — its rules "
+            "are UNMEASURED, not zero")
+        return entry
+    if data is None:
+        entry["unmeasured"].append(
+            f"detections: the {role} catalog {path} is ABSENT — its rules are UNMEASURED, not zero")
+        return entry
+    records = _catalog_rules(data)
+    entry["readable"] = True
+    entry["rule_records"] = records
+    entry["rules"] = [r["rule"] for r in records]
+    entry["count"] = len(records)
+    return entry
+
+
+def _catalog_summary(c: dict[str, Any]) -> dict[str, Any]:
+    """A catalog's identity for the provenance (``/meta``) panel — no rule records."""
+    return {
+        "role": c["role"],
+        "name": c["name"],
+        "path": c["path"],
+        "provenance": c["provenance"],
+        "engine": c["engine"],
+        "lake": c["lake"],
+        "lake_source": c["lake_source"],
+        "present": c["present"],
+        "readable": c["readable"],
+        "count": c["count"],
+        "rules": list(c["rules"]),
+    }
+
+
+def _shadow_report(resolved_ids: set[str]) -> tuple[list[dict], list[str]]:
+    """Every OTHER live detection catalog in the scripts store, as a SHADOW entry — never a silence.
+
+    Naming the suite's two catalogs is not a licence to stop looking: a THIRD catalog that something
+    on this host reads must not become invisible merely because it is not one of the two named ones.
+    MEASURED 2026-09-18 on this host — the defect this function was written for: with only a
+    first-candidate rule in place, ``siem-detections.json``, read every five minutes by a cron with
+    ``file_cards: true``, was reported as if it were the resolved catalog and its rules vanished
+    from the panel. It is now a NAMED catalog of its own (see ``_detections``); this function covers
+    what is left — a live catalog that is neither of the two named ones and not a STAGING file.
+
+    A shadowed catalog is named here (file, every rule id). An ABSENT one says nothing (an absence
+    is not a finding); an UNREADABLE one gets its own note and is still not a zero.
     """
     shadowed: list[dict] = []
     notes: list[str] = []
-    for name, provenance, kind in DETECTION_CANDIDATES:
-        path = _scripts_dir() / name
-        if chosen is not None and path == chosen:
+    root = _scripts_dir()
+    if not root.is_dir():
+        return shadowed, notes
+    for path in sorted(root.glob("*detections*.json")):
+        if not path.is_file() or path.name in KNOWN_CATALOG_FILES:
+            continue
+        if path.name in STAGING_CATALOGS:
+            # A staging file, not a catalog of the suite (see ``STAGING_CATALOGS``): it is not a
+            # finding and it is not counted — and it is not a `shadowed` entry either, because that
+            # would claim a live catalog this panel is declining to resolve.
             continue
         data, err = _read_json(path)
         if err:
@@ -449,82 +619,95 @@ def _shadow_report(chosen: Optional[Path], resolved_ids: set[str]) -> tuple[list
             continue
         extra = [i for i in ids if i not in resolved_ids]
         if extra:
-            shadowed.append({"path": str(path), "provenance": provenance, "kind": kind,
-                             "count": len(extra), "rules": extra})
+            shadowed.append({"path": str(path), "provenance": "unresolved-catalog",
+                             "kind": "shadowed", "count": len(extra), "rules": extra})
             notes.append(
-                f"detections: {len(extra)} rule(s) are SHADOWED — they live in {path} ({provenance}) "
-                f"and not in the catalog resolved for this panel. They are neither unread nor zero: "
+                f"detections: {len(extra)} rule(s) are SHADOWED — they live in {path} and NEITHER "
+                f"named catalog resolves it. They are neither unread nor zero: "
                 f"{', '.join(extra[:10])}" + ("…" if len(extra) > 10 else ""))
         else:
-            notes.append(f"detections: {path} ({provenance}) carries {len(ids)} rule(s), every one of "
-                         "them also in the resolved catalog — nothing shadowed there")
+            notes.append(f"detections: {path} carries {len(ids)} rule(s), every one of them also "
+                         "in a named catalog — nothing shadowed there")
     return shadowed, notes
 
 
 def _detections() -> dict[str, Any]:
-    """The detection catalog, plus every other live catalog beside it (see ``_shadow_report``).
+    """BOTH named catalogs of the suite, each with its own identity and its own rule ids.
 
-    The first READABLE candidate wins (contract §5 freezes ``psec-detections.json`` as the index).
-    A candidate that is PRESENT BUT UNREADABLE is a refusal that names itself — and the other
-    catalog's rules are still reported as shadowed there, rather than the panel rendering a
-    read failure as a zero-rule catalog.
+    ⛔ There is NO candidate order and NO substitution here. The platform catalog is resolved BY
+    NAME (§5's index) and the endpoint catalog is reported beside it as the suite's second named
+    catalog; an absent or unreadable platform index is UNMEASURED for platform detection and says
+    so. The reader this replaces resolved the first readable candidate and fell back to the endpoint
+    catalog under the label ``legacy``, so rules from another engine, another lake and another rule
+    shape rendered as THE platform index — the substitution the ruling on ``t_0e78bcf9`` removes.
+
+    ``rules`` is therefore the PLATFORM catalog's records (the matrix's input) and NOTHING else;
+    the endpoint catalog is under ``endpoint_catalog`` with its own ids, and ``catalogs`` carries
+    both. A genuine third catalog is still reported under ``shadowed``.
     """
-    for name, provenance, kind in DETECTION_CANDIDATES:
-        path = _scripts_dir() / name
-        data, err = _read_json(path)
-        if err:
-            shadowed, notes = _shadow_report(path, set())
-            return {"rules": [], "path": str(path), "provenance": provenance, "kind": kind,
-                    "errors": [err], "shadowed": shadowed,
-                    "unmeasured": [f"detections: {path} unreadable: {err}"] + notes}
-        if data is None:
-            continue
-        raw = data.get("rules")
-        rules: list[dict[str, Any]] = []
-        if isinstance(raw, list):
-            for r in raw:
-                if not isinstance(r, dict):
-                    continue
-                rules.append({
-                    "rule": r.get("name") or r.get("rule") or "?",
-                    "title": r.get("title") or "",
-                    "severity": r.get("severity") or "",
-                    "stream": r.get("stream") or "",
-                    "platforms": r.get("platforms") or "all",
-                    "maturity": r.get("maturity") or "",
-                    "suppression_key": r.get("suppression_key") or "",
-                })
-        elif isinstance(raw, dict):
-            for name, r in raw.items():
-                if not isinstance(r, dict):
-                    continue
-                rules.append({
-                    "rule": name,
-                    "title": r.get("title") or "",
-                    "severity": r.get("severity") or "",
-                    "stream": r.get("stream") or "",
-                    "platforms": r.get("platforms") or "all",
-                    "maturity": r.get("maturity") or "",
-                    "suppression_key": r.get("suppression_key") or "",
-                })
-        unmeasured: list[str] = []
-        if provenance != "scripts-store":
-            unmeasured.append(
-                f"detections: psec-detections.json (contract §5) is not installed; reading the live "
-                f"predecessor {path.name} — rule ids are real, the platform/maturity fields are not "
-                "part of the predecessor's contract"
-            )
-            for r in rules:
-                if not r["maturity"]:
-                    r["maturity"] = "unmeasured"
-        shadowed, notes = _shadow_report(path, {r["rule"] for r in rules})
-        unmeasured.extend(notes)
-        return {"rules": rules, "path": str(path), "provenance": provenance, "kind": kind,
-                "errors": [], "shadowed": shadowed, "unmeasured": unmeasured}
-    return {"rules": [], "path": None, "provenance": None, "kind": None, "errors": [],
-            "shadowed": [],
-            "unmeasured": ["detections: no detection index found (neither psec-detections.json nor "
-                           "siem-detections.json) — rules are unknown, not zero"]}
+    unmeasured: list[str] = []
+    plat_path = _scripts_dir() / PLATFORM_CATALOG_FILE
+    endp_path = _scripts_dir() / ENDPOINT_CATALOG_FILE
+
+    plat_lake, plat_lake_src, plat_lake_notes = _catalog_lake(PLATFORM_LAKE_CONFIG, "platform")
+    endp_lake, endp_lake_src, endp_lake_notes = _catalog_lake(ENDPOINT_LAKE_CONFIG, "endpoint")
+
+    platform = _catalog_entry(
+        plat_path, role="platform", name="platform catalog — the frozen §5 index",
+        provenance=PLATFORM_CATALOG_PROVENANCE, engine=PLATFORM_CATALOG_ENGINE,
+        lake=plat_lake, lake_source=plat_lake_src)
+    endpoint = _catalog_entry(
+        endp_path, role="endpoint", name="endpoint catalog — the suite's second named index",
+        provenance=ENDPOINT_CATALOG_PROVENANCE, engine=ENDPOINT_CATALOG_ENGINE,
+        lake=endp_lake, lake_source=endp_lake_src)
+    platform["unmeasured"].extend(plat_lake_notes)
+    endpoint["unmeasured"].extend(endp_lake_notes)
+
+    rules: list[dict[str, Any]] = list(platform.pop("rule_records", []))
+    endpoint.pop("rule_records", None)
+
+    # --- the PLATFORM side, by name. No fallback, no substitution ------------------------------
+    if not platform["readable"]:
+        why = "present but UNREADABLE" if platform["present"] else "ABSENT"
+        platform["unmeasured"].append(
+            f"detections: PLATFORM DETECTION IS UNMEASURED — the platform catalog ({plat_path}) is "
+            f"{why}, and an absent index is NOT covered by the endpoint catalog: that is a "
+            "different engine (siem-detect.py, every 5 min) reading a different lake, and its rules "
+            "are not what this index resolved to.")
+    unmeasured.extend(platform["unmeasured"])
+    unmeasured.extend(endpoint["unmeasured"])
+
+    plat_ids = [r["rule"] for r in rules]
+    endp_ids = list(endpoint["rules"])
+    overlap = sorted(set(plat_ids) & set(endp_ids))
+    union = sorted(set(plat_ids) | set(endp_ids))
+    errors: list[str] = list(platform["errors"])
+    if overlap:
+        errors.append(f"rule id(s) in BOTH catalogs: {', '.join(overlap)}")
+        unmeasured.append(
+            f"detections: {len(overlap)} rule id(s) appear in BOTH catalogs "
+            f"({', '.join(overlap)}) — they are double-counted, and the two catalogs are not "
+            "comparable rule-for-rule")
+
+    shadowed, notes = _shadow_report(set(union))
+    unmeasured.extend(notes)
+
+    return {
+        "rules": rules,
+        "rules_total": len(rules),
+        "path": str(plat_path) if platform["present"] else None,
+        "provenance": PLATFORM_CATALOG_PROVENANCE if platform["readable"] else None,
+        "kind": "platform" if platform["readable"] else None,
+        "errors": errors,
+        "shadowed": shadowed,
+        "catalogs": [platform, endpoint],
+        "platform_catalog": platform,
+        "endpoint_catalog": endpoint,
+        "catalogs_rules_total": len(union),
+        "rule_ids_shared": overlap,
+        "comparability": COMPARABILITY,
+        "unmeasured": unmeasured,
+    }
 
 
 # --- lake --------------------------------------------------------------------
@@ -1190,7 +1373,10 @@ def meta():
         "registry": {"root": reg["root"], "provenance": reg["provenance"],
                      "tenants": len(reg["tenants"]), "errors": reg["errors"]},
         "detections": {"path": det["path"], "provenance": det["provenance"],
-                       "rules": len(det["rules"]), "shadowed": det["shadowed"]},
+                       "rules": det["rules_total"], "rules_total": det["rules_total"],
+                       "catalogs_rules_total": det["catalogs_rules_total"],
+                       "catalogs": [_catalog_summary(c) for c in det["catalogs"]],
+                       "shadowed": det["shadowed"]},
         "lake": {"root": lake["lake_root"], "provenance": lake["provenance"],
                  "feeds": len(lake["feeds"])},
         "retirement": {"path": post["path"], "provenance": post["provenance"]},
@@ -1301,6 +1487,12 @@ def coverage(tenant: Optional[str] = None):
     Coverage is a claim, not a measurement (contract §3.4): what IS measured here is rules enabled /
     rules total, the tenant's declared sources, and each rule's platform scope. Anything else is
     named in ``unmeasured``.
+
+    The matrix is the PLATFORM catalog's (contract §5's index). The suite's ENDPOINT catalog is
+    returned beside it — its own entry, its own engine, its own lake, its own ids — precisely so
+    that a reader cannot take these ``rules_total`` rows for the estate's whole detection coverage.
+    The two catalogs are not comparable rule-for-rule; only their ids are counted together
+    (``catalogs_rules_total``).
     """
     reg = _load_registry()
     chosen = _tenant_or_refuse(tenant, reg["tenants"])
@@ -1328,13 +1520,20 @@ def coverage(tenant: Optional[str] = None):
             })
         rows.append({"rule": rule["rule"], "title": rule["title"], "severity": rule["severity"],
                      "stream": rule["stream"], "maturity": rule["maturity"], "cells": cells})
-    if det["provenance"] != "scripts-store" and det["rules"]:
-        # The predecessor index carries no per-tenant `enabled` list either; the registry's own
-        # `detections.enabled` is authoritative and real, so the join is real even if sparse.
+    if det["endpoint_catalog"]["readable"]:
+        # The matrix is the PLATFORM catalog's, and it must never be read as the estate's whole
+        # detection coverage: the endpoint catalog is a second named catalog of the suite, read by
+        # another engine against another lake (ruling on t_0e78bcf9). Its rules are NOT in this
+        # matrix and are NOT comparable rule-for-rule with these — only the ids are counted together.
         unmeasured.append(
-            "coverage: rules came from the live predecessor index; a rule present there but absent "
-            "from a registry's detections.enabled renders `not_enabled`, which may mean 'not yet "
-            "declared' rather than 'off'"
+            "coverage: `rules_total` counts the PLATFORM catalog only "
+            f"({det['rules_total']} rule(s), engine {det['platform_catalog']['engine']}). The "
+            f"ENDPOINT catalog is the suite's second named catalog "
+            f"({det['endpoint_catalog']['count']} rule(s), engine "
+            f"{det['endpoint_catalog']['engine']}, lake "
+            f"{det['endpoint_catalog']['lake'] or 'unmeasured'}) and is NOT in this matrix: "
+            "different engine, different lake, not comparable rule-for-rule. Between them the "
+            f"suite's catalogs carry {det['catalogs_rules_total']} distinct rule id(s)."
         )
     # The other direction of the same join, and the honest one: a detection a tenant's registry
     # ENABLES that the catalog does not carry is a GAP, not a quiet zero. Name it.
@@ -1360,6 +1559,13 @@ def coverage(tenant: Optional[str] = None):
         "declared_only": declared_only,
         "detections_source": det["path"],
         "detections_provenance": det["provenance"],
+        # BOTH catalogs of the suite, each with its own identity and its own rule ids. The matrix
+        # above is the platform catalog's alone — see the `comparability` note.
+        "catalogs": det["catalogs"],
+        "platform_catalog": det["platform_catalog"],
+        "endpoint_catalog": det["endpoint_catalog"],
+        "catalogs_rules_total": det["catalogs_rules_total"],
+        "comparability": det["comparability"],
         "shadowed": det["shadowed"],
         "shadowed_rules_total": sum(s["count"] for s in det["shadowed"]),
         "unmeasured": unmeasured,
