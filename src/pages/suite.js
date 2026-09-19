@@ -257,6 +257,7 @@
               : h("span", { className: "mc-muted" }, "unmeasured")),
             h("td", null, r.device_id ? h("span", { title: r.subject || "" }, r.device_id.length > 22 ? r.device_id.slice(0, 22) + "…" : r.device_id) : "—"),
             h("td", null, h(Pill, { kind: r.lifecycle === "unrecognised_status" ? "mc-pill-err" : "" }, r.lifecycle),
+              r.archived ? h(Pill, { kind: "mc-pill-warn" }, "archived") : null,
               r.block_kind ? h("span", { className: "mc-muted" }, " " + r.block_kind) : null),
             h("td", null, dur(r.age_seconds)),
             h("td", null, r.stale ? h(Pill, { kind: "mc-pill-err" }, "stale") : h("span", { className: "mc-muted" }, "—")),

@@ -743,6 +743,56 @@ class ProtectionSuiteApi(unittest.TestCase):
         self.assertEqual(row["lifecycle"], "triaging")
         self.assertIsNone(row["disposition"], "a park reason is not a disposition")
 
+    # --- the archived state (t_009c278c) --------------------------------------
+
+    def test_an_archived_finding_keeps_its_row_and_is_flagged(self):
+        """`archived` is a SILENCING state for a FINDING, not a closure (contract §7).
+
+        The read used to filter ``status != 'archived'``, so an archived finding was counted NOWHERE:
+        no row, no disposition, no MTTR, and `_attribution` never ran for it. MEASURED
+        2026-09-19T01:20:57–01:21:02Z: seven fixture-artefact `psec-gaps-detect` cards were archived
+        by their adjudicating lane (card `t_2a666fa6`, "harness artefact, not a finding") and the
+        queue's PSEC population fell 134 -> 127, none of the seven carrying a disposition anywhere.
+        The adjudications were sound; the STATE was the defect.
+
+        The second half is the MUTATION CONTROL: the OLD filter is re-inserted in a COPY of the
+        module and the same fixture leaves the queue again, so the arm proves the widening and not
+        the fixture.
+        """
+        m = _load(self.home, self.artifact)
+        _make_board(self.home, "b1", [
+            {"id": "t_done", "title": "PSEC [high] x", "body": "", "assignee": "x", "status": "done",
+             "created_by": "psec-gaps-detect", "created_at": 1_700_000_000,
+             "completed_at": 1_700_000_500, "result": "false positive — fixture"},
+            {"id": "t_arch", "title": "PSEC [high] y", "body": "", "assignee": "x",
+             "status": "archived", "created_by": "psec-gaps-detect", "created_at": 1_700_000_100},
+        ])
+        rows = {r["id"]: r for r in m._read_findings()["rows"]}
+        self.assertIn("t_arch", rows, "an archived finding must stay in the record")
+        self.assertEqual(rows["t_arch"]["lifecycle"], "resolved", "CARD_TO_SOC already maps it")
+        self.assertIs(rows["t_arch"]["archived"], True)
+        self.assertEqual(rows["t_arch"]["disposition"], "resolved (disposition unrecorded)")
+        self.assertIs(rows["t_done"]["archived"], False, "a `done` row is not archived")
+
+        source = (PLUGIN / "dashboard" / "plugin_api.py").read_text()
+        mutant = source.replace(
+            "                    WHERE (created_by IN ({placeholders}) OR title LIKE 'SIEM [%'"
+            " OR title LIKE 'PSEC [%')\n",
+            "                    WHERE (created_by IN ({placeholders}) OR title LIKE 'SIEM [%'"
+            " OR title LIKE 'PSEC [%')\n                      AND status != 'archived'\n", 1)
+        self.assertNotEqual(mutant, source, "the mutation control could not re-insert the old filter")
+        mut_path = Path(self.tmp.name) / "plugin_api_mutant.py"
+        mut_path.write_text(mutant)
+        for stale in ("psec_api", "hermes_cli.kanban_db"):
+            sys.modules.pop(stale, None)
+        spec = importlib.util.spec_from_file_location("psec_api", mut_path)
+        mut = importlib.util.module_from_spec(spec)
+        sys.modules["psec_api"] = mut
+        spec.loader.exec_module(mut)
+        ids = {r["id"] for r in mut._read_findings()["rows"]}
+        self.assertNotIn("t_arch", ids, "reverting the read must drop the archived finding again")
+        self.assertIn("t_done", ids, "the mutation control must not drop anything else")
+
     # --- parsing -------------------------------------------------------------
     def test_worker_started_at_style_values_never_become_ages(self):
         m = _load(self.home, self.artifact)

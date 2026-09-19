@@ -943,7 +943,17 @@ def _read_findings() -> dict[str, Any]:
     Read directly from each board's SQLite (read-only), not from an API, so the operator surface
     cannot disagree with the ledger.
 
-    Nothing is filtered or capped HERE, on purpose. The scope predicate (tenant, lifecycle state)
+    Nothing is filtered or capped HERE, on purpose. No STATUS is excluded either: a finding card that
+    is ``archived`` is INCLUDED and carries ``archived: True`` on its row. For a FINDING, `archived`
+    is a SILENCING state, not a closure (contract §7) — the read used to filter ``status !=
+    'archived'``, so an archived finding was counted NOWHERE: no row, no disposition, no MTTR, and
+    ``_attribution`` never ran for it. MEASURED 2026-09-19T01:20:57–01:21:02Z: seven fixture-artefact
+    `psec-gaps-detect` cards were archived by their adjudicating lane (card `t_2a666fa6`, "harness
+    artefact, not a finding") and the queue's PSEC population fell **134 → 127**, with no disposition
+    recorded for any of the seven. The adjudications were sound; the STATE was the defect. The
+    status→lifecycle map below already reads `archived → resolved`; what was missing was the ROW.
+
+    The scope predicate (tenant, lifecycle state)
     belongs to the caller and the row cap belongs AFTER it: a cap applied to the whole-estate read
     makes a scoped read report another scope's numbers, and lets a tenant's rows disappear behind an
     estate-wide cap and render as a false zero (04 §3.1, §3.4 — "a failed measurement must never
@@ -973,7 +983,6 @@ def _read_findings() -> dict[str, Any]:
                            block_kind, last_heartbeat_at, body, result{summary_arm}
                     FROM tasks
                     WHERE (created_by IN ({placeholders}) OR title LIKE 'SIEM [%' OR title LIKE 'PSEC [%')
-                      AND status != 'archived'
                     ORDER BY created_at DESC, id DESC
                     """,
                     FINDING_CREATORS,
@@ -1003,6 +1012,11 @@ def _read_findings() -> dict[str, Any]:
                 "device_id": parsed["device_id"],
                 "detail": parsed["detail"],
                 "card_status": r["status"],
+                # `archived` is a SILENCING state for a finding, not a closure (contract §7), so the
+                # row is INCLUDED above and the record survives. This flag is what tells an archived
+                # row apart from a `done` one that reached the same `resolved` lifecycle: read off
+                # the ledger's own status column, never inferred and never defaulted.
+                "archived": r["status"] == "archived",
                 "lifecycle": soc,
                 "block_kind": r["block_kind"],
                 "assignee": r["assignee"],
