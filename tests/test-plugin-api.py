@@ -801,5 +801,307 @@ class ProtectionSuiteApi(unittest.TestCase):
         self.assertEqual(m._int_or_none("1789710809"), 1789710809)
 
 
+    # --- AWS: a LIVE probe in three states, never a config claim, never a zero (t_7c560aaf) ------
+    #
+    # The panel's content is decided by the probe. Every fixture below stubs the TWO seams that
+    # touch the outside world (`_aws_probe_live` and `_aws_lake_counts`), so the arms are hermetic
+    # and the estate is never read — while the code under test is the SHIPPED code path, from
+    # `_aws_panel` down through the state machine.
+
+    AWS_ACCOUNT = "912632857388"
+
+    def _aws_fixture(self, *, guardduty_error=None) -> dict:
+        """The MEASURED 2026-09-19 shape: ONE multi-region trail in every region, detectors in six
+        regions and EMPTY in two, Security Hub not subscribed, no account password policy."""
+        trail = {"Name": "jpthegeek-multiregion", "HomeRegion": "us-east-1",
+                 "IsMultiRegionTrail": True, "LogFileValidationEnabled": True,
+                 "S3BucketName": "jpthegeek-cloudtrail-912632857388", "IsLogging": True,
+                 "IsLogging_error": None}
+        detectors = {"us-east-1": ["d0d05a6e"], "us-east-2": ["2ad05a6e"], "us-west-2": ["ccd05a6e"],
+                     "eu-central-1": ["c0d05a6e"], "eu-west-1": ["26d05a6e"], "us-west-1": ["96d05a6e"],
+                     "ap-southeast-2": [], "eu-west-2": []}
+        if guardduty_error is not None:
+            detectors = {k: {"error": "InvalidSignatureException", "reason": guardduty_error}
+                         for k in detectors}
+        return {
+            "identity": {"account": self.AWS_ACCOUNT,
+                         "arn": f"arn:aws:iam::{self.AWS_ACCOUNT}:user/hermes-protection-audit"},
+            "region": "us-east-1",
+            "regions": ["us-east-1", "us-east-2", "us-west-1", "us-west-2", "eu-west-1",
+                        "eu-central-1", "ap-southeast-2", "eu-west-2"],
+            "regions_error": None,
+            "cloudtrail": {"regions": {r: [dict(trail)] for r in
+                                       ("us-east-1", "us-east-2", "us-west-2", "eu-west-1",
+                                        "ap-southeast-2", "eu-west-2")} | {"ap-southeast-1": []},
+                           "error": None},
+            "guardduty": {"regions": detectors, "error": None},
+            "securityhub": {"status": "not_subscribed",
+                            "reason": "An error occurred (InvalidAccessException) ... is not "
+                                      "subscribed to AWS Security Hub"},
+            "password_policy": {"status": "absent",
+                                "reason": "An error occurred (NoSuchEntity) when calling the "
+                                          "GetAccountPasswordPolicy operation"},
+            "iam_users": 69,
+        }
+
+    def _aws_tenant(self, platform: str = "alpha", *, account: str | None = None) -> None:
+        """A registry record whose ONLY cloud is AWS — exactly the shape onestack.yaml carries."""
+        d = self.home / "scripts" / "platform-registry"
+        d.mkdir(parents=True, exist_ok=True)
+        (d / f"{platform}.json").write_text(json.dumps({
+            "platform": platform, "display_name": platform.upper(), "status": "active",
+            "maturity": "enforcing", "products": ["a"],
+            "clouds": [{"cloud": "aws", "account": account or self.AWS_ACCOUNT,
+                        "account_verified": True,
+                        "credential_ref": "secret://env/AWS_PROTECTION_AUDIT_ACCESS_KEY_ID",
+                        "sources": ["cloudtrail_lookup_events"], "access": "read-only"}],
+            "assets": [], "detections": {"enabled": [], "waivers": []}, "routing": {},
+        }))
+
+    def _aws_credential_file(self, platform: str = "alpha") -> Path:
+        """The secret store the registry names — the same file the connector resolves. Its VALUES
+        are never used by these arms (the probe is stubbed), which is the point."""
+        d = self.home / ".secrets" / platform / "aws"
+        d.mkdir(parents=True, exist_ok=True)
+        p = d / "estate.json"
+        p.write_text(json.dumps({"access_key_id": "AKIAFIXTURE", "secret_access_key": "fixture-only",
+                                 "region": "us-east-1"}))
+        return p
+
+    def _aws_lake_root(self) -> None:
+        (self.home / "scripts" / "psec-sources.json").write_text(
+            json.dumps({"lake_root": "/mnt/lake-platform"}))
+
+    def _stub_aws(self, m, *, lake_rows=2327, lake_ok=True, probe_error=None, fixture=None):
+        def fake_probe(cred, timeout):
+            if probe_error:
+                raise RuntimeError(probe_error)
+            return json.loads(json.dumps(fixture if fixture is not None else self._aws_fixture()))
+
+        def fake_lake(root, platform, source, producer):
+            return {"producer": producer, "source": source, "root": root,
+                    "rows": lake_rows if lake_ok else None,
+                    "last_event": "2026-09-19 16:50:10" if lake_ok else None,
+                    "ok": lake_ok,
+                    "reason": None if lake_ok else "lake probe exited 1: no duckdb"}
+        m._aws_probe_live = fake_probe
+        m._aws_lake_counts = fake_lake
+
+    def _aws_panel_stubbed(self, **kw):
+        m = _load(self.home, self.artifact)
+        self._aws_tenant()
+        self._aws_credential_file()
+        self._aws_lake_root()
+        self._stub_aws(m, **kw)
+        return m
+
+    def test_aws_probe_present_and_rows_is_enabled_and_producing(self):
+        """THE ACCEPTANCE: a live probe answers, the lake holds rows -> `enabled and producing`,
+        and the answer comes from the PROBE, not from what the registry declares.
+
+        The positive control is the second half: the same probe result with an EMPTY registry
+        declaration (no `sources` at all) renders the SAME state, so the state provably came from
+        the measurement and not from the claim.
+        """
+        m = self._aws_panel_stubbed(lake_rows=2327)
+        out = m.aws(tenant="alpha")
+        self.assertEqual(out["state"], "enabled_producing")
+        self.assertEqual(out["count"], 1)
+        a = out["accounts"][0]
+        self.assertEqual(a["probe"]["status"], "ok")
+        self.assertEqual(a["identity"]["account"], self.AWS_ACCOUNT)
+        self.assertEqual(a["identity"]["arn"],
+                         f"arn:aws:iam::{self.AWS_ACCOUNT}:user/hermes-protection-audit")
+        self.assertEqual(len(a["probe"]["regions_probed"]), 8)
+        self.assertTrue(a["probe"]["credential_source"].endswith("/.secrets/alpha/aws/estate.json"))
+        rows = {r["id"]: r for r in a["surfaces"]}
+        self.assertEqual(rows["cloudtrail"]["state"], "enabled_producing")
+        self.assertEqual(rows["cloudtrail"]["lake_rows"], 2327)
+        self.assertIn("aws-cloudtrail", rows["cloudtrail"]["finding"])
+        # ⛔ presence and INGESTION are different facts: no source reads the trail's S3 bucket.
+        self.assertIn("NOT from the trail", rows["cloudtrail"]["details"]["trail_s3_ingest"])
+        self.assertEqual(rows["cloudtrail"]["details"]["trails"][0]["IsLogging"], True)
+        # GuardDuty is present and NOT ingested — a missing SOURCE, not silence.
+        self.assertEqual(rows["guardduty"]["state"], "no_source")
+        self.assertEqual(rows["guardduty"]["lake_rows"], None)
+        self.assertIn("ap-southeast-2", rows["guardduty"]["regions_empty"])
+        self.assertIn("that asymmetry is a finding", rows["guardduty"]["finding"])
+        # The registry's own row is carried as a CLAIM and labelled as one.
+        self.assertEqual(a["declared"]["account"], self.AWS_ACCOUNT)
+        self.assertIn("CLAIM", a["declared"]["note"])
+
+        # POSITIVE CONTROL: strip the declaration; the measured state must not move.
+        m2 = self._aws_panel_stubbed(lake_rows=2327)
+        reg = json.loads((self.home / "scripts" / "platform-registry" / "alpha.json").read_text())
+        reg["clouds"][0]["sources"] = []
+        reg["clouds"][0]["account_verified"] = False
+        (self.home / "scripts" / "platform-registry" / "alpha.json").write_text(json.dumps(reg))
+        r2 = m2.aws(tenant="alpha")
+        self.assertEqual(r2["state"], "enabled_producing",
+                         "the state must come from the probe, never from the registry's claim")
+        self.assertEqual(r2["accounts"][0]["surfaces"][0]["state"], "enabled_producing")
+
+    def test_aws_probe_present_but_no_rows_is_enabled_but_silent(self):
+        """Present and NOT producing is its own state — never an absence, never a zero."""
+        m = self._aws_panel_stubbed(lake_rows=0)
+        out = m.aws(tenant="alpha")
+        rows = {r["id"]: r for r in out["accounts"][0]["surfaces"]}
+        self.assertEqual(rows["cloudtrail"]["state"], "enabled_silent")
+        self.assertEqual(rows["cloudtrail"]["state_label"], "enabled but silent")
+        self.assertEqual(rows["cloudtrail"]["lake_rows"], 0)
+        self.assertIn("ENABLED BUT SILENT", rows["cloudtrail"]["finding"])
+        self.assertNotEqual(out["state"], "enabled_producing")
+        # ...and the page has a worded branch for it: a measured 0 is rendered WITH its meaning.
+        bundle = (PLUGIN / "dashboard" / "dist" / "index.js").read_text()
+        self.assertIn("0 rows — silent", bundle,
+                      "a measured zero must render with its meaning, never as a bare number")
+
+    def test_aws_probe_refusal_renders_unmeasurable_not_an_empty_panel(self):
+        """THE ACCEPTANCE: a refused/timed-out probe renders `UNMEASURABLE: <reason>` — the four
+        surfaces are all present and all say so, and no count is a zero."""
+        m = self._aws_panel_stubbed(probe_error="RuntimeError: the probe did not finish within 90s")
+        out = m.aws(tenant="alpha")
+        self.assertEqual(out["state"], "unmeasurable")
+        self.assertIn("did not finish within 90s", out["reason"])
+        a = out["accounts"][0]
+        self.assertEqual(a["probe"]["status"], "unmeasurable")
+        self.assertEqual(len(a["surfaces"]), 4, "the panel is NOT empty: every surface states itself")
+        for r in a["surfaces"]:
+            self.assertEqual(r["state"], "unmeasurable")
+            self.assertTrue(r["finding"].startswith("UNMEASURABLE: "), r["finding"])
+            self.assertIsNone(r["lake_rows"], "an unmeasured count is None, never 0")
+        # The account's lake read is a SEPARATE measurement from the probe, so it is still reported
+        # (and is only ever a number or None — never a bare zero standing in for a state).
+
+    def test_aws_an_unreadable_lake_is_unmeasurable_and_not_silent(self):
+        """`could not read the lake` is the THIRD state: it must not render as `enabled but silent`."""
+        m = self._aws_panel_stubbed(lake_rows=None, lake_ok=False)
+        out = m.aws(tenant="alpha")
+        rows = {r["id"]: r for r in out["accounts"][0]["surfaces"]}
+        self.assertEqual(rows["cloudtrail"]["state"], "unmeasurable")
+        self.assertIsNone(rows["cloudtrail"]["lake_rows"],
+                          "an unread lake is None — 0 would claim the source ran and landed nothing")
+        self.assertIn("presence alone is NOT the producing state", rows["cloudtrail"]["finding"])
+        self.assertNotEqual(rows["cloudtrail"]["state"], "enabled_silent")
+
+    def test_aws_absent_surfaces_are_stated_absences_not_zeros(self):
+        """Security Hub not subscribed and no account password policy: BOTH are stated absences."""
+        m = self._aws_panel_stubbed(lake_rows=2327)
+        rows = {r["id"]: r for r in m.aws(tenant="alpha")["accounts"][0]["surfaces"]}
+        self.assertEqual(rows["securityhub"]["state"], "absent")
+        self.assertEqual(rows["securityhub"]["state_label"], "ABSENT — a stated absence, not a zero")
+        self.assertIn("NOT subscribed", rows["securityhub"]["finding"])
+        self.assertEqual(rows["password_policy"]["state"], "absent")
+        self.assertIn("NoSuchEntity", rows["password_policy"]["finding"])
+        self.assertIn("69 IAM user(s)", rows["password_policy"]["finding"])
+        self.assertIs(rows["securityhub"]["present"], False)
+        self.assertIs(rows["password_policy"]["present"], False)
+
+    def test_aws_a_password_policy_that_exists_is_configured(self):
+        m = self._aws_panel_stubbed()
+        fix = self._aws_fixture()
+        fix["password_policy"] = {"status": "present",
+                                  "policy": {"MinimumPasswordLength": 14,
+                                             "PasswordReusePrevention": 24}}
+        m._aws_probe_live = lambda cred, timeout: fix
+        rows = {r["id"]: r for r in m.aws(tenant="alpha")["accounts"][0]["surfaces"]}
+        self.assertEqual(rows["password_policy"]["state"], "configured")
+        self.assertIn("MinimumPasswordLength=14", rows["password_policy"]["finding"])
+
+    def test_aws_a_signing_error_is_never_reported_as_a_permission_error(self):
+        """MEASURED 2026-09-18: GuardDuty is REST-JSON; the JSON-1.1 `x-amz-target` form answers
+        *Unable to determine service/operation name to be authorized* — a SIGNING error, not an
+        IAM refusal. Reporting it as a permission error files a false finding on the identity."""
+        m = _load(self.home, self.artifact)
+        kind, why = m._aws_classify_error(
+            "An error occurred (InvalidSignatureException) ... Unable to determine "
+            "service/operation name to be authorized")
+        self.assertEqual(kind, "signing_error")
+        self.assertIn("NOT a permission error", why)
+        self.assertEqual(m._aws_classify_error("AccessDenied: User is not authorized")[0], "refused")
+        self.assertEqual(m._aws_classify_error("... is not subscribed to AWS Security Hub")[0],
+                         "not_subscribed")
+        self.assertEqual(m._aws_classify_error("NoSuchEntity")[0], "absent")
+
+        m = self._aws_panel_stubbed(
+            fixture=self._aws_fixture(guardduty_error="Unable to determine service/operation name "
+                                                     "to be authorized"))
+        a = m.aws(tenant="alpha")["accounts"][0]
+        gd = {r["id"]: r for r in a["surfaces"]}["guardduty"]
+        self.assertEqual(gd["state"], "unmeasurable")
+        self.assertTrue(any("SIGNING error" in u for u in gd["unmeasured"]),
+                        f"the classifier must name the signing error: {gd['unmeasured']}")
+
+    def test_aws_a_refused_identity_makes_the_account_unmeasurable(self):
+        """sts:GetCallerIdentity refused => the panel cannot say WHICH account it read: unmeasured."""
+        fix = self._aws_fixture()
+        fix["identity"] = {"error": "AccessDenied", "reason": "not authorized to perform sts:GetCallerIdentity"}
+        fix["regions"] = []
+        m = self._aws_panel_stubbed(fixture=fix)
+        out = m.aws(tenant="alpha")
+        self.assertEqual(out["state"], "unmeasurable")
+        self.assertIn("sts:GetCallerIdentity was refused", out["reason"])
+
+    def test_aws_a_missing_credential_is_unmeasured_not_healthy(self):
+        m = _load(self.home, self.artifact)
+        self._aws_tenant()
+        saved = {n: os.environ.pop(n, None) for n in
+                 ("AWS_PROTECTION_AUDIT_ACCESS_KEY_ID", "AWS_PROTECTION_AUDIT_SECRET_ACCESS_KEY",
+                  "AWS_PROTECTION_AUDIT_REGION")}
+        try:
+            m._aws_probe_live = lambda cred, timeout: self.fail("the probe must not run without a credential")
+            out = m.aws(tenant="alpha")
+        finally:
+            for k, v in saved.items():
+                if v is not None:
+                    os.environ[k] = v
+        self.assertEqual(out["state"], "unmeasurable")
+        self.assertIn("no read-only AWS credential", out["reason"])
+        self.assertTrue(all(r["state"] == "unmeasurable" for r in out["accounts"][0]["surfaces"]))
+
+    def test_aws_no_declared_aws_cloud_is_a_stated_absence(self):
+        m = _load(self.home, self.artifact)
+        (self.home / "scripts" / "platform-registry").mkdir(parents=True, exist_ok=True)
+        (self.home / "scripts" / "platform-registry" / "alpha.json").write_text(_registry_record("alpha"))
+        m._aws_probe_live = lambda cred, timeout: self.fail("no AWS declaration => no probe")
+        out = m.aws(tenant="alpha")
+        self.assertEqual(out["state"], "absent")
+        self.assertEqual(out["count"], 0)
+        self.assertIn("NO `cloud: aws`", out["reason"])
+
+    def test_aws_tenant_is_required_like_every_other_read(self):
+        m = _load(self.home, self.artifact)
+        with self.assertRaises(Exception) as ctx:
+            m.aws(tenant=None)
+        self.assertIn("tenant is required", str(ctx.exception))
+
+    def test_aws_meta_names_the_probe_without_running_it(self):
+        """/meta is read on every page load; it must NOT wait on ~35 AWS calls."""
+        m = _load(self.home, self.artifact)
+        m._aws_probe_live = lambda cred, timeout: self.fail("/meta must not run the AWS probe")
+        meta = m.meta()
+        self.assertIn("aws", meta)
+        self.assertEqual(meta["aws"]["endpoint"], "/aws?tenant=<slug>")
+        self.assertIn("cloudtrail:DescribeTrails(includeShadowTrails=True)", meta["aws"]["calls"])
+        self.assertIn("does not run the probe", meta["aws"]["note"])
+
+    # --- the built bundle is the sources (acceptance 4) ----------------------
+
+    def test_the_built_bundle_matches_the_sources_it_was_built_from(self):
+        """`dist/` is what the browser loads; a source edit that was never rebuilt ships nothing.
+
+        build.sh CONCATENATES src/core.js + src/pages/suite.js into dist/index.js verbatim, so the
+        arm is exact: every source's bytes must appear in the bundle, and the CSS must be identical.
+        """
+        bundle = (PLUGIN / "dashboard" / "dist" / "index.js").read_text()
+        for src in [PLUGIN / "src" / "core.js"] + sorted((PLUGIN / "src" / "pages").glob("*.js")):
+            self.assertIn(src.read_text(), bundle, f"{src.name} is missing from the built bundle — "
+                                                   "re-run build.sh")
+        self.assertEqual((PLUGIN / "src" / "style.css").read_text(),
+                         (PLUGIN / "dashboard" / "dist" / "style.css").read_text(),
+                         "dist/style.css must be the source CSS")
+        self.assertIn("AWS control plane — a LIVE probe", bundle)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

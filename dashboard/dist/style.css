@@ -89,3 +89,10 @@ table.mc-table tr:hover td { background: color-mix(in srgb, var(--color-ring) 6%
 .ps-sev-medium { border-color: #ffce3a; color: #ffce3a; }
 .ps-sev-low { border-color: #6f7cff; color: #6f7cff; }
 .ps-sev-info { border-color: var(--color-border); color: var(--color-muted-foreground); }
+
+/* One block per AWS account, inside the AWS panel: the probe, the registry's CLAIM beside it, and
+   the four surfaces. Separated so a two-account scope cannot read as one account's state. */
+.ps-aws-block {
+  border: 1px solid var(--color-border); border-radius: var(--radius, .5rem);
+  padding: .6rem .7rem; display: flex; flex-direction: column; gap: .5rem;
+}

@@ -51,6 +51,12 @@ Sources, each with its own name (a source that is absent is reported, never gues
                   what this suite does, and explicitly what it does NOT do (no host prevention, no
                   host rollback). A decision is not a measurement, so it is versioned with the
                   module and never inferred; see ``_capability``.
+    aws           a LIVE read-only probe of the AWS account's control plane
+                  (``cloudtrail:DescribeTrails`` + ``GetTrailStatus``, ``guardduty:ListDetectors``,
+                  ``securityhub:DescribeHub``, ``iam:GetAccountPasswordPolicy``) under the registry's
+                  read-only identity, CACHED with an explicit age, plus the lake's own rows for
+                  ``producer=aws-cloudtrail``. What the registry DECLARES is carried and labelled
+                  ``declared`` and is never the answer; see ``_aws_panel``.
 
 The plugin dir is un-versioned live config: ``git init`` lives inside it. Keep the module
 importable at all times — a syntax error here is a tab that answers 500 for every profile.
@@ -64,6 +70,7 @@ import os
 import re
 import sqlite3
 import subprocess
+import sys
 import time
 from contextlib import closing
 from datetime import datetime, timezone
@@ -1398,6 +1405,723 @@ def _capability() -> dict[str, Any]:
     }
 
 
+# --- the AWS control-plane panel ---------------------------------------------
+#
+# WHY THIS PANEL EXISTS. MEASURED 2026-09-19 (cards t_6dc8c120 + t_31c93028): AWS account
+# 912632857388 has a real multi-region CloudTrail and GuardDuty detectors in six regions, and this
+# dashboard rendered NONE of it — the string `aws` did not occur in this module or in suite.js. A
+# surface a reader would expect to be covered and cannot see is one half of the defect class this
+# suite exists to remove; a FALSE ZERO is the other half. So:
+#
+#   * the panel's content is decided by a LIVE PROBE, never by what the registry DECLARES. The
+#     registry row is carried under `declared` and labelled as the claim it is — a panel that
+#     renders configuration as measurement is the thing this card exists to prevent;
+#   * every surface is in ONE of the states in ``AWS_STATE_LABELS``, and a bare ``0`` is never one
+#     of them. ``enabled_producing`` requires BOTH the control-plane object (a trail, a detector)
+#     AND rows in the lake for the producer that carries it: presence and ingestion are DIFFERENT
+#     facts (no source reads the trail's S3 bucket) and the panel must not conflate them;
+#   * the lake side is read from the lake's OWN parquet partitions (producer column), never inferred
+#     from the probe.
+#
+# The probe is the call surface ``aws_audit.py`` makes
+# (``~/hermes-outbox/2026-09-18-aws-telemetry-t_6dc8c120/``), under the registry's read-only
+# identity. It runs in a CHILD interpreter (boto3 is not importable in every caller), is bounded by
+# a timeout, and is cached with an explicit age: a dashboard request renders
+# ``UNMEASURABLE: <reason>`` rather than blocking the page on AWS latency.
+#
+# ⛔ NOTHING HERE ENABLES, CREATES OR MODIFIES AN AWS RESOURCE. The identity is read-only and stays
+# read-only: the probe calls Describe*/List*/Get* and nothing else.
+#
+# ⛔ /meta DOES NOT RUN THIS PROBE. A page-load read that waits on ~35 AWS calls is exactly the
+# "blocking the page" the card forbids; /meta names the panel and its call surface instead. The
+# probe runs when the AWS panel itself is opened, and its result is cached for PSEC_AWS_PROBE_TTL.
+
+AWS_STATE_LABELS = {
+    "enabled_producing": "enabled and producing",
+    "enabled_silent": "enabled but silent",
+    "no_source": "present — no source ingests it (presence is not ingestion)",
+    "configured": "configured (measured by the probe; no lake source)",
+    "absent": "ABSENT — a stated absence, not a zero",
+    "unmeasurable": "UNMEASURABLE",
+}
+
+# The producer that carries CloudTrail into the lake, and the stream it lands on. MEASURED
+# 2026-09-19 in the lake: platform=onestack/source=cloud_audit, producer=aws-cloudtrail.
+AWS_CLOUDTRAIL_PRODUCER = "aws-cloudtrail"
+AWS_CLOUDTRAIL_SOURCE = "cloud_audit"
+
+AWS_PY_CANDIDATES = tuple(
+    p for p in (sys.executable, "/home/hermes/.hermes/hermes-agent/venv/bin/python", "/usr/bin/python3") if p
+)
+_AWS_PY: list[Optional[str]] = []          # memo of the first interpreter that can import boto3
+
+AWS_PROBE_TTL_S = _clamp_int(os.environ.get("PSEC_AWS_PROBE_TTL"), 300, 0, 86_400)
+AWS_PROBE_TIMEOUT_S = _clamp_int(os.environ.get("PSEC_AWS_PROBE_TIMEOUT"), 90, 5, 600)
+AWS_PROBE_FAIL_TTL_S = 60
+
+_AWS_CACHE: dict[str, dict[str, Any]] = {}
+
+# The read-only identity's environment names. NOT `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY`:
+# MEASURED, those hold hermes-monitoring, which is DENIED cloudtrail:LookupEvents.
+AWS_CRED_NAMES = ("AWS_PROTECTION_AUDIT_ACCESS_KEY_ID", "AWS_PROTECTION_AUDIT_SECRET_ACCESS_KEY",
+                  "AWS_PROTECTION_AUDIT_REGION")
+
+# The probe. Reads its credential from STDIN (never argv: argv is world-readable in `ps`), and
+# prints ONE json object on stdout. Every call is individually guarded so a refusal in one region
+# cannot take the whole read down — and the failure MODE is preserved (an `AccessDenied`, a
+# `not subscribed`, a `NoSuchEntity` and a transport error are four different facts).
+_AWS_PROBE = r'''
+import json, sys
+req = json.load(sys.stdin)
+import boto3
+from botocore.config import Config
+
+cfg = Config(retries={"max_attempts": 2, "mode": "standard"}, connect_timeout=5, read_timeout=15)
+AK, SK = req["access_key_id"], req["secret_access_key"]
+R0 = req.get("region") or "us-east-1"
+
+def client(svc, region):
+    return boto3.client(svc, aws_access_key_id=AK, aws_secret_access_key=SK,
+                        region_name=region, config=cfg)
+
+def err(e):
+    s = str(e)
+    return {"error": type(e).__name__, "reason": (s.splitlines()[0] if s.splitlines() else type(e).__name__)[:300]}
+
+out = {"identity": None, "region": R0, "regions": [], "regions_error": None,
+       "cloudtrail": {"regions": {}, "error": None}, "guardduty": {"regions": {}, "error": None},
+       "securityhub": {"status": None, "reason": None}, "password_policy": {"status": None, "reason": None},
+       "iam_users": None}
+
+try:
+    ident = client("sts", R0).get_caller_identity()
+    out["identity"] = {"account": ident.get("Account"), "arn": ident.get("Arn")}
+except Exception as e:
+    out["identity"] = err(e)
+
+try:
+    rs = client("ec2", R0).describe_regions(AllRegions=True).get("Regions", [])
+    out["regions"] = sorted(r["RegionName"] for r in rs
+                            if r.get("OptInStatus") in ("opt-in-not-required", "opted-in"))
+except Exception as e:
+    out["regions_error"] = err(e)
+
+for r in out["regions"]:
+    try:
+        tl = client("cloudtrail", r).describe_trails(includeShadowTrails=True).get("trailList", [])
+        rows = []
+        for x in tl:
+            row = {k: x.get(k) for k in ("Name", "HomeRegion", "IsMultiRegionTrail",
+                                         "LogFileValidationEnabled", "S3BucketName")}
+            # IsLogging is NOT on DescribeTrails' response -- aws_audit.py read the wrong key for it.
+            # GetTrailStatus is the call that answers it, so the panel measures it instead of
+            # repeating a mislabelled field.
+            row["IsLogging"] = None
+            row["IsLogging_error"] = None
+            try:
+                row["IsLogging"] = bool(client("cloudtrail", r).get_trail_status(Name=x.get("Name")).get("IsLogging"))
+            except Exception as e:
+                row["IsLogging_error"] = err(e)
+            rows.append(row)
+        out["cloudtrail"]["regions"][r] = rows
+    except Exception as e:
+        out["cloudtrail"]["regions"][r] = err(e)
+    try:
+        out["guardduty"]["regions"][r] = client("guardduty", r).list_detectors().get("DetectorIds", [])
+    except Exception as e:
+        out["guardduty"]["regions"][r] = err(e)
+
+try:
+    h = client("securityhub", R0).describe_hub()
+    out["securityhub"] = {"status": "subscribed", "reason": None, "hub_arn": h.get("HubArn")}
+except Exception as e:
+    msg = (str(e).splitlines()[0] if str(e).splitlines() else str(e))[:300]
+    bad = err(e)
+    if "not subscribed" in str(e).lower():
+        out["securityhub"] = {"status": "not_subscribed", "reason": msg}
+    else:
+        out["securityhub"] = {"status": "refused", "reason": msg, "error": bad["error"]}
+
+try:
+    out["password_policy"] = {"status": "present",
+                              "policy": client("iam", R0).get_account_password_policy().get("PasswordPolicy")}
+except Exception as e:
+    msg = (str(e).splitlines()[0] if str(e).splitlines() else str(e))[:300]
+    if type(e).__name__ == "NoSuchEntityException" or "NoSuchEntity" in str(e):
+        out["password_policy"] = {"status": "absent", "reason": msg}
+    else:
+        out["password_policy"] = {"status": "refused", "reason": msg, "error": type(e).__name__}
+
+try:
+    out["iam_users"] = len(client("iam", R0).list_users().get("Users", []))
+except Exception:
+    out["iam_users"] = None
+
+print(json.dumps(out))
+'''
+
+# The lake side: ONE grouped read of the partition's own `producer` column.
+_AWS_LAKE_PROBE = r'''
+import json, sys
+import duckdb
+req = json.load(sys.stdin)
+con = duckdb.connect()
+out = {}
+for p in req["probes"]:
+    try:
+        rows = con.execute(
+            "select producer, count(*) as n, max(event_time) as mx "
+            "from read_parquet('" + p["glob"] + "', hive_partitioning=true) group by 1"
+        ).fetchall()
+        hit = [r for r in rows if r[0] == p["producer"]]
+        out[p["key"]] = {"ok": True, "rows": int(hit[0][1]) if hit else 0,
+                         "last_event": str(hit[0][2]) if hit and hit[0][2] is not None else None,
+                         "producers": sorted(str(r[0]) for r in rows)}
+    except Exception as exc:
+        out[p["key"]] = {"ok": False, "error": type(exc).__name__ + ": " + (
+            str(exc).splitlines()[0] if str(exc).splitlines() else "")}
+print(json.dumps(out))
+'''
+
+
+def _aws_python() -> Optional[str]:
+    """The first candidate interpreter that can ``import boto3`` (memoised, including the negative)."""
+    if _AWS_PY:
+        return _AWS_PY[0]
+    for cand in AWS_PY_CANDIDATES:
+        if not Path(cand).is_file():
+            continue
+        try:
+            r = subprocess.run([cand, "-c", "import boto3"], capture_output=True, text=True,
+                               timeout=30, check=False)
+        except Exception:  # noqa: BLE001
+            continue
+        if r.returncode == 0:
+            _AWS_PY.append(cand)
+            return cand
+    _AWS_PY.append(None)
+    return None
+
+
+def _env_value(name: str) -> Optional[str]:
+    """One variable from the environment, else from THIS hermes home's own ``.env``.
+
+    Cron does not inherit ``.env``, so a reader must be able to open it. It is read from
+    ``_hermes_home()`` and never from a hardcoded path, so a test's temp home can never silently
+    read the live estate's secrets.
+    """
+    v = os.environ.get(name)
+    if v and v.strip():
+        return v.strip()
+    try:
+        for line in (_hermes_home() / ".env").read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            k, _, val = line.partition("=")
+            if k.strip() == name:
+                val = val.strip().strip('"').strip("'")
+                return val or None
+    except Exception:  # noqa: BLE001
+        return None
+    return None
+
+
+def _aws_credential(platform: str, cloud: dict[str, Any]) -> tuple[Optional[dict[str, Any]], Optional[str]]:
+    """The read-only identity, resolved the way the registry says it is resolved. Never logged.
+
+    Two places, in order: the secret store the registry names (``.secrets/<platform>/aws/estate.json``
+    — the same file the CloudTrail connector resolves ``secret://aws/estate`` to), then the
+    ``AWS_PROTECTION_AUDIT_*`` names in this home's ``.env``. NEITHER is a config claim about the
+    account: the credential is only the identity the probe signs with.
+    """
+    store = _hermes_home() / ".secrets" / str(platform) / "aws" / "estate.json"
+    data, err = _read_json(store)
+    if isinstance(data, dict) and data.get("access_key_id") and data.get("secret_access_key"):
+        return ({"access_key_id": data["access_key_id"],
+                 "secret_access_key": data["secret_access_key"],
+                 "region": data.get("region") or "us-east-1",
+                 "source": str(store)}, None)
+    tried = [f"{store} " + (f"unreadable ({err})" if err else "absent or incomplete")]
+    vals = {n: _env_value(n) for n in AWS_CRED_NAMES}
+    if vals[AWS_CRED_NAMES[0]] and vals[AWS_CRED_NAMES[1]]:
+        return ({"access_key_id": vals[AWS_CRED_NAMES[0]],
+                 "secret_access_key": vals[AWS_CRED_NAMES[1]],
+                 "region": vals[AWS_CRED_NAMES[2]] or "us-east-1",
+                 "source": "env:" + AWS_CRED_NAMES[0]}, None)
+    tried.append(f"{_hermes_home() / '.env'} has no complete {AWS_CRED_NAMES[0]} / "
+                 f"{AWS_CRED_NAMES[1]} pair")
+    return None, ("no read-only AWS credential: " + "; ".join(tried)
+                  + " — the AWS control plane is UNMEASURED, not healthy")
+
+
+def _aws_reason(val: Any) -> str:
+    if isinstance(val, dict):
+        return str(val.get("reason") or val.get("error") or "no reason given")
+    return str(val)
+
+
+def _aws_classify_error(text: str) -> tuple[str, str]:
+    """A SIGNING error is not a permission error.
+
+    MEASURED 2026-09-18 (card t_7c560aaf): GuardDuty is REST-JSON (``GET /detector``); the
+    JSON-1.1 ``x-amz-target`` form answers *Unable to determine service/operation name to be
+    authorized*, which is the signer failing to find the operation — NOT a refusal by IAM. Reporting
+    it as a permission error would file a false finding against the identity.
+    """
+    t = (text or "").lower()
+    if "unable to determine service/operation name to be authorized" in t:
+        return "signing_error", ("SIGNING error — the request form does not identify the operation; "
+                                 "this is NOT a permission error and NOT a coverage gap")
+    if "accessdenied" in t or "not authorized" in t or "unauthorized" in t or "implicit deny" in t:
+        return "refused", "permission refused by the identity"
+    if "not subscribed" in t:
+        return "not_subscribed", "the account is not subscribed"
+    if "nosuchentity" in t:
+        return "absent", "the object does not exist (a stated absence)"
+    return "error", "the call failed"
+
+
+def _aws_probe_live(cred: dict[str, Any], timeout: int) -> dict[str, Any]:
+    """Run the probe in a child interpreter. Raises RuntimeError with a NAMED reason on failure."""
+    py = _aws_python()
+    if not py:
+        raise RuntimeError("no interpreter with boto3 (tried " + ", ".join(AWS_PY_CANDIDATES) + ")")
+    payload = {"access_key_id": cred["access_key_id"], "secret_access_key": cred["secret_access_key"],
+               "region": cred.get("region") or "us-east-1"}
+    try:
+        proc = subprocess.run([py, "-c", _AWS_PROBE], input=json.dumps(payload),
+                              capture_output=True, text=True, timeout=timeout, check=False)
+    except subprocess.TimeoutExpired:
+        raise RuntimeError(f"the probe did not finish within {timeout}s")
+    if proc.returncode != 0:
+        raise RuntimeError(f"the probe exited {proc.returncode}: {(proc.stderr or '').strip()[:300]}")
+    try:
+        return json.loads(proc.stdout.strip().splitlines()[-1])
+    except Exception as exc:  # noqa: BLE001
+        raise RuntimeError(f"the probe output was unparseable: {exc}")
+
+
+def _aws_probe_cached(key: str, cred: dict[str, Any]) -> tuple[Optional[dict], Optional[str], dict]:
+    """The probe's result and its AGE. A failure is cached briefly too, so a cold AWS does not make
+    every page load pay the timeout."""
+    now = _now()
+    hit = _AWS_CACHE.get(key)
+    if hit:
+        age = now - int(hit["at"])
+        ttl = int(hit.get("ttl") or AWS_PROBE_TTL_S)
+        if age <= ttl:
+            return (hit.get("data"), hit.get("error"),
+                    {"cached": True, "age_seconds": age, "ttl_seconds": ttl,
+                     "measured_at": _iso(hit["at"])})
+    t0 = time.time()
+    data, err = None, None
+    try:
+        data = _aws_probe_live(cred, AWS_PROBE_TIMEOUT_S)
+    except Exception as exc:  # noqa: BLE001
+        err = f"{type(exc).__name__}: {exc}"
+    ttl = AWS_PROBE_TTL_S if err is None else min(AWS_PROBE_FAIL_TTL_S, AWS_PROBE_TTL_S or AWS_PROBE_FAIL_TTL_S)
+    _AWS_CACHE[key] = {"at": now, "ttl": ttl, "data": data, "error": err}
+    return (data, err, {"cached": False, "age_seconds": 0, "ttl_seconds": ttl,
+                        "duration_s": round(time.time() - t0, 1), "measured_at": _iso(now)})
+
+
+def _aws_lake_counts(lake_root: Optional[str], platform: str, source: str,
+                     producer: str) -> dict[str, Any]:
+    """Rows in the lake for ONE producer, read from the partition itself. Never inferred.
+
+    ``rows`` is ``None`` when the lake could not be read — never ``0``. The distinction is the whole
+    point: ``0`` means "the source ran and landed nothing" (enabled but silent); ``None`` means
+    "I could not measure it", which is a third state and must not be rendered as the second.
+    """
+    out: dict[str, Any] = {"producer": producer, "source": source, "root": lake_root,
+                           "rows": None, "last_event": None, "ok": False, "reason": None}
+    if not lake_root:
+        out["reason"] = "no lake_root resolved (psec-sources.json)"
+        return out
+    py = _lake_python()
+    if not py:
+        out["reason"] = "no lake interpreter (duckdb lives in /home/hermes/.lakevenv)"
+        return out
+    if not _SAFE_IDENT.match(str(platform)) or not _SAFE_IDENT.match(str(source)):
+        out["reason"] = f"refused: unsafe partition name platform={platform!r} source={source!r}"
+        return out
+    glob = f"{lake_root.rstrip('/')}/platform={platform}/source={source}/**/*.parquet"
+    if not _SAFE_GLOB.match(glob):
+        out["reason"] = f"refused: unsafe glob {glob}"
+        return out
+    try:
+        proc = subprocess.run(
+            [py, "-c", _AWS_LAKE_PROBE],
+            input=json.dumps({"probes": [{"key": "k", "glob": glob, "producer": producer}]}),
+            capture_output=True, text=True, timeout=120, check=False)
+    except Exception as exc:  # noqa: BLE001
+        out["reason"] = f"lake probe failed to run: {type(exc).__name__}: {exc}"
+        return out
+    if proc.returncode != 0:
+        out["reason"] = f"lake probe exited {proc.returncode}: {(proc.stderr or '').strip()[:200]}"
+        return out
+    try:
+        res = json.loads(proc.stdout.strip().splitlines()[-1])["k"]
+    except Exception as exc:  # noqa: BLE001
+        out["reason"] = f"lake probe output unparseable: {exc}"
+        return out
+    if not res.get("ok"):
+        out["reason"] = str(res.get("error"))
+        return out
+    out["ok"] = True
+    out["rows"] = res.get("rows")
+    out["last_event"] = res.get("last_event")
+    out["producers_seen"] = res.get("producers")
+    return out
+
+
+def _aws_row(sid: str, surface: str, calls: list[str], state: str, *, present: Optional[bool],
+             finding: str, regions_present: Optional[list[str]] = None,
+             regions_empty: Optional[list[str]] = None, regions_error: Optional[dict] = None,
+             lake: Optional[dict[str, Any]] = None, lake_reason: Optional[str] = None,
+             details: Optional[dict[str, Any]] = None,
+             unmeasured: Optional[list[str]] = None) -> dict[str, Any]:
+    """One control-plane surface, in ONE of ``AWS_STATE_LABELS``. There is no path that returns a
+    bare count here: ``lake_rows`` is ``None`` when it was not measured, and the state is what the
+    page renders."""
+    return {
+        "id": sid,
+        "surface": surface,
+        "probe_calls": list(calls),
+        "state": state,
+        "state_label": AWS_STATE_LABELS.get(state, state),
+        "present": present,
+        "regions_present": regions_present,
+        "regions_empty": regions_empty,
+        "regions_error": regions_error or None,
+        "lake_producer": (lake or {}).get("producer"),
+        "lake_source": (lake or {}).get("source"),
+        "lake_rows": (lake or {}).get("rows"),
+        "lake_last_event": (lake or {}).get("last_event"),
+        "lake_reason": (lake_reason if lake_reason is not None else (lake or {}).get("reason")),
+        "finding": finding,
+        "details": details or {},
+        "unmeasured": list(unmeasured or []),
+    }
+
+
+def _aws_regions_split(block: Any) -> tuple[list[str], list[str], dict[str, str]]:
+    """A probe block's regions split into present / empty / errored — from the response SHAPE, so a
+    region that answered with an error can never be counted as an empty one."""
+    regions = (block or {}).get("regions") or {}
+    present, empty, errors = [], [], {}
+    for r in sorted(regions):
+        val = regions[r]
+        if isinstance(val, list):
+            (present if val else empty).append(r)
+        else:
+            errors[r] = _aws_reason(val)
+    return present, empty, errors
+
+
+def _aws_cloudtrail_row(probe: dict[str, Any], lake: dict[str, Any]) -> dict[str, Any]:
+    """CloudTrail: the control-plane record, and — separately — whether it is INGESTED."""
+    calls = ["cloudtrail:DescribeTrails(includeShadowTrails=True)", "cloudtrail:GetTrailStatus"]
+    present_r, empty_r, err_r = _aws_regions_split(probe.get("cloudtrail"))
+    probed = len((probe.get("cloudtrail") or {}).get("regions") or {})
+    trails = [{"region": r, **x} for r, v in sorted((probe.get("cloudtrail") or {}).get("regions", {}).items())
+              if isinstance(v, list) for x in v]
+    unmeasured: list[str] = []
+    if err_r:
+        unmeasured.append(f"cloudtrail: {len(err_r)} of {probed} probed region(s) answered with an "
+                          "error: " + "; ".join(f"{k}: {v}" for k, v in err_r.items()))
+    details = {"trails": trails, "trail_s3_ingest":
+               "no source reads the trail's S3 bucket (a missing SOURCE, filed separately); the lake "
+               "rows for producer=aws-cloudtrail come from cloudtrail:LookupEvents (event history), "
+               "NOT from the trail"}
+    if not probed:
+        why = _aws_reason(probe.get("regions_error")) if probe.get("regions_error") else "the probe listed no region"
+        return _aws_row("cloudtrail", "CloudTrail trails — the control-plane record", calls,
+                        "unmeasurable", present=None,
+                        finding=f"the region list could not be read: {why} — UNMEASURABLE, not an empty estate",
+                        unmeasured=unmeasured, details=details)
+    if not present_r and len(err_r) == probed:
+        return _aws_row("cloudtrail", "CloudTrail trails — the control-plane record", calls,
+                        "unmeasurable", present=None, regions_empty=empty_r, regions_error=err_r,
+                        finding="every probed region answered with an error: "
+                                + "; ".join(f"{k}: {v}" for k, v in err_r.items()),
+                        unmeasured=unmeasured, details=details)
+    if not present_r:
+        state = "absent"
+        finding = (f"no trail in any of the {probed} probed region(s) — an absent control-plane "
+                   "record, stated as absent and NOT rendered as a zero")
+    elif not lake.get("ok"):
+        state = "unmeasurable"
+        finding = (f"trail present in {len(present_r)} region(s), but the lake rows for "
+                   f"producer={AWS_CLOUDTRAIL_PRODUCER} could not be read ({lake.get('reason')}) — "
+                   "presence alone is NOT the producing state, so this is UNMEASURABLE")
+    elif (lake.get("rows") or 0) > 0:
+        state = "enabled_producing"
+        finding = (f"trail(s) {', '.join(sorted({str(t.get('Name')) for t in trails}))} present; "
+                   f"{lake['rows']:,} row(s) in {lake['source']} for "
+                   f"producer={AWS_CLOUDTRAIL_PRODUCER} — ingested via cloudtrail:LookupEvents, "
+                   "NOT from the trail's S3 bucket")
+    else:
+        state = "enabled_silent"
+        finding = ("the trail is present and its producer exists, but 0 rows have landed for "
+                   f"producer={AWS_CLOUDTRAIL_PRODUCER} — ENABLED BUT SILENT, a distinct finding "
+                   "and not a zero")
+    return _aws_row("cloudtrail", "CloudTrail trails — the control-plane record", calls, state,
+                    present=True, regions_present=present_r, regions_empty=empty_r,
+                    regions_error=err_r, lake=lake, finding=finding, unmeasured=unmeasured,
+                    details=details)
+
+
+def _aws_guardduty_row(probe: dict[str, Any]) -> dict[str, Any]:
+    """GuardDuty detectors — and the asymmetry between regions, which is a finding, not a bug."""
+    calls = ["guardduty:ListDetectors"]
+    present_r, empty_r, err_r = _aws_regions_split(probe.get("guardduty"))
+    probed = len((probe.get("guardduty") or {}).get("regions") or {})
+    unmeasured: list[str] = []
+    if err_r:
+        signing = [k for k, v in err_r.items() if _aws_classify_error(v)[0] == "signing_error"]
+        note = (f"guardduty: {len(err_r)} of {probed} region(s) errored: "
+                + "; ".join(f"{k}: {v}" for k, v in err_r.items()))
+        if signing:
+            note += (" — classifier: SIGNING error under the JSON-1.1 x-amz-target form; with the "
+                     "REST-JSON (GET /detector) form boto3 uses here this must NOT be read as a "
+                     "permission refusal")
+        unmeasured.append(note)
+    lake_reason = ("no producer carries GuardDuty findings into this lake — its detectors are "
+                   "measured by the probe only; presence is not ingestion")
+    details = {"detectors": {r: v for r, v in ((probe.get("guardduty") or {}).get("regions") or {}).items()
+                             if isinstance(v, list)}}
+    if not probed:
+        why = _aws_reason(probe.get("regions_error")) if probe.get("regions_error") else "the probe listed no region"
+        return _aws_row("guardduty", "GuardDuty detectors", calls, "unmeasurable", present=None,
+                        finding=f"the region list could not be read: {why}", lake_reason=lake_reason,
+                        unmeasured=unmeasured, details=details)
+    if not present_r and len(err_r) == probed:
+        return _aws_row("guardduty", "GuardDuty detectors", calls, "unmeasurable", present=None,
+                        regions_empty=empty_r, regions_error=err_r,
+                        finding="every probed region answered with an error: "
+                                + "; ".join(f"{k}: {v}" for k, v in err_r.items()),
+                        lake_reason=lake_reason, unmeasured=unmeasured, details=details)
+    if present_r:
+        state = "no_source"
+        finding = (f"detector(s) in {len(present_r)} region(s) ({', '.join(present_r)}); EMPTY in "
+                   f"{len(empty_r)} ({', '.join(empty_r) or 'none'}) — that asymmetry is a finding, "
+                   "not a probe bug. No producer ingests GuardDuty findings, so presence is NOT "
+                   "ingestion: a missing SOURCE, stated as such.")
+    else:
+        state = "absent"
+        finding = (f"no detector in any of the {probed} probed region(s) — stated as absent, "
+                   "never as a zero")
+    return _aws_row("guardduty", "GuardDuty detectors", calls, state, present=bool(present_r),
+                    regions_present=present_r, regions_empty=empty_r, regions_error=err_r,
+                    finding=finding, lake_reason=lake_reason, unmeasured=unmeasured, details=details)
+
+
+def _aws_securityhub_row(probe: dict[str, Any]) -> dict[str, Any]:
+    calls = ["securityhub:DescribeHub"]
+    sh = probe.get("securityhub") or {}
+    status = sh.get("status")
+    lake_reason = ("no producer carries Security Hub findings into this lake — a missing SOURCE, "
+                   "stated as such")
+    if status == "subscribed":
+        return _aws_row("securityhub", "Security Hub", calls, "no_source", present=True,
+                        finding=f"subscribed ({sh.get('hub_arn') or 'hub arn not returned'}); nothing "
+                                "ingests its findings into this lake",
+                        lake_reason=lake_reason)
+    if status == "not_subscribed":
+        return _aws_row("securityhub", "Security Hub", calls, "absent", present=False,
+                        finding="DescribeHub: the account is NOT subscribed to AWS Security Hub — a "
+                                "stated ABSENCE, not a zero",
+                        lake_reason=lake_reason)
+    kind, why = _aws_classify_error(sh.get("reason") or "")
+    return _aws_row("securityhub", "Security Hub", calls, "unmeasurable", present=None,
+                    finding=f"DescribeHub did not answer ({kind}): {why} — {sh.get('reason')}",
+                    lake_reason=lake_reason)
+
+
+def _aws_password_policy_row(probe: dict[str, Any]) -> dict[str, Any]:
+    calls = ["iam:GetAccountPasswordPolicy"]
+    pol = probe.get("password_policy") or {}
+    users = probe.get("iam_users")
+    over = f" over {users} IAM user(s)" if isinstance(users, int) else ""
+    lake_reason = "the account password policy is an IAM setting; no lake source exists for it"
+    status = pol.get("status")
+    if status == "present":
+        p = pol.get("policy") or {}
+        return _aws_row("password_policy", "IAM account password policy", calls, "configured",
+                        present=True,
+                        finding=f"an account password policy IS set (MinimumPasswordLength="
+                                f"{p.get('MinimumPasswordLength')}, ReusePreventionCount="
+                                f"{p.get('PasswordReusePrevention')})",
+                        lake_reason=lake_reason, details={"policy": p})
+    if status == "absent":
+        return _aws_row("password_policy", "IAM account password policy", calls, "absent",
+                        present=False,
+                        finding=f"iam:GetAccountPasswordPolicy -> NoSuchEntity{over}: NO account "
+                                "password policy exists — a stated ABSENCE, not a zero",
+                        lake_reason=lake_reason)
+    kind, why = _aws_classify_error(pol.get("reason") or "")
+    return _aws_row("password_policy", "IAM account password policy", calls, "unmeasurable",
+                    present=None,
+                    finding=f"GetAccountPasswordPolicy did not answer ({kind}): {why} — "
+                            f"{pol.get('reason')}", lake_reason=lake_reason)
+
+
+def _aws_account_entry(t: dict[str, Any], cloud: dict[str, Any],
+                       lake_root: Optional[str], lake: dict[str, Any]) -> dict[str, Any]:
+    """One AWS account: the live probe, the lake, and the four surfaces it answers for."""
+    platform = str(t["platform"])
+    account = cloud.get("account")
+    declared = {
+        # ⛔ A CLAIM, LABELLED AS ONE. Rendered beside the measurement, never as it.
+        "cloud": cloud.get("cloud"), "account": account,
+        "account_verified": bool(cloud.get("account_verified")),
+        "credential_ref": cloud.get("credential_ref"),
+        "sources": list(cloud.get("sources") or []),
+        "access": cloud.get("access"),
+        "note": "what the REGISTRY declares — a CLAIM, never this panel's answer: the content above "
+                "comes from the live probe",
+    }
+    cred, cred_err = _aws_credential(platform, cloud)
+    probe_meta: dict[str, Any] = {"cached": False}
+    data: Optional[dict] = None
+    if cred is None:
+        probe = {"status": "unmeasurable", "reason": cred_err, "identity": None}
+    else:
+        data, err, probe_meta = _aws_probe_cached(f"{platform}|{account}", cred)
+        if err is not None:
+            probe = {"status": "unmeasurable", "reason": err, "identity": None}
+        elif not isinstance(data, dict):
+            probe = {"status": "unmeasurable", "reason": "the probe returned no result", "identity": None}
+        elif isinstance(data.get("identity"), dict) and data["identity"].get("error"):
+            probe = {"status": "unmeasurable",
+                     "reason": "sts:GetCallerIdentity was refused ("
+                               + _aws_reason(data["identity"])
+                               + ") — the probe could not establish WHICH account it is, so nothing "
+                                 "about this account is measured",
+                     "identity": None}
+        else:
+            probe = {"status": "ok", "reason": None, "identity": data.get("identity")}
+
+    if probe["status"] != "ok":
+        reason = probe["reason"] or "the probe could not run"
+        rows = [
+            _aws_row("cloudtrail", "CloudTrail trails — the control-plane record",
+                     ["cloudtrail:DescribeTrails(includeShadowTrails=True)", "cloudtrail:GetTrailStatus"],
+                     "unmeasurable", present=None, finding="UNMEASURABLE: " + reason),
+            _aws_row("guardduty", "GuardDuty detectors", ["guardduty:ListDetectors"], "unmeasurable",
+                     present=None, finding="UNMEASURABLE: " + reason),
+            _aws_row("securityhub", "Security Hub", ["securityhub:DescribeHub"], "unmeasurable",
+                     present=None, finding="UNMEASURABLE: " + reason),
+            _aws_row("password_policy", "IAM account password policy", ["iam:GetAccountPasswordPolicy"],
+                     "unmeasurable", present=None, finding="UNMEASURABLE: " + reason),
+        ]
+    else:
+        pd: dict[str, Any] = data or {}
+        rows = [
+            _aws_cloudtrail_row(pd, lake),
+            _aws_guardduty_row(pd),
+            _aws_securityhub_row(pd),
+            _aws_password_policy_row(pd),
+        ]
+
+    states = [r["state"] for r in rows]
+    if probe["status"] != "ok":
+        state, reason = "unmeasurable", probe["reason"]
+    elif "enabled_producing" in states:
+        state, reason = "enabled_producing", None
+    elif "enabled_silent" in states:
+        state, reason = "enabled_silent", None
+    elif all(s == "unmeasurable" for s in states):
+        state, reason = "unmeasurable", "every surface was unmeasurable"
+    elif any(s in ("no_source", "configured") for s in states):
+        state, reason = "present_no_ingest", None
+    else:
+        state, reason = "absent", None
+
+    unmeasured = [u for r in rows for u in r["unmeasured"]]
+    if probe["status"] == "ok" and isinstance(data, dict) and not data.get("regions"):
+        unmeasured.append("aws: the probe listed no enabled region — every regional surface is "
+                          "unmeasured, not empty")
+    if lake_root is None:
+        unmeasured.append("aws: no lake_root resolved, so the ingestion half of the control-plane "
+                          "surfaces is unmeasured (presence alone is not ingestion)")
+    return {
+        "platform": platform,
+        "declared": declared,
+        "identity": probe.get("identity"),
+        "probe": {
+            "status": probe["status"], "reason": probe["reason"],
+            "calls": ["cloudtrail:DescribeTrails(includeShadowTrails=True)", "cloudtrail:GetTrailStatus",
+                      "guardduty:ListDetectors", "securityhub:DescribeHub",
+                      "iam:GetAccountPasswordPolicy"],
+            "credential_source": None if cred is None else cred.get("source"),
+            "cache": probe_meta,
+            "timeout_s": AWS_PROBE_TIMEOUT_S, "ttl_s": AWS_PROBE_TTL_S,
+            "regions_probed": (data or {}).get("regions") or [],
+            "iam_users": (data or {}).get("iam_users"),
+        },
+        "lake": {"root": lake_root, "producer": lake.get("producer"), "source": lake.get("source"),
+                 "rows": lake.get("rows"), "last_event": lake.get("last_event"),
+                 "ok": lake.get("ok"), "reason": lake.get("reason")},
+        "state": state, "state_label": AWS_STATE_LABELS.get(state, state), "reason": reason,
+        "counts": {k: states.count(k) for k in AWS_STATE_LABELS if states.count(k)},
+        "surfaces": rows,
+        "unmeasured": unmeasured,
+    }
+
+
+def _aws_panel(chosen: str, reg: dict[str, Any]) -> dict[str, Any]:
+    """Every AWS account the chosen scope declares, each probed live and stated in three states."""
+    tenants = reg["tenants"] if chosen == "all" else [t for t in reg["tenants"] if t["platform"] == chosen]
+    clouds = [(t, c) for t in tenants for c in (t["clouds"] or [])
+              if str(c.get("cloud") or "").lower() == "aws"]
+    as_of = _as_of()
+    if not clouds:
+        return {
+            "as_of": as_of, "tenant": chosen, "accounts": [], "count": 0,
+            "state": "absent", "state_label": AWS_STATE_LABELS["absent"],
+            "reason": f"the registry declares NO `cloud: aws` for tenant {chosen!r} — a stated "
+                      "absence, not a zero",
+            "probe_calls": [], "unmeasured": [], "counts": {},
+        }
+    lake_root = _lake_config()["lake_root"]
+    # ONE lake read per (platform, producer), shared across accounts of the same tenant: the
+    # partition is the tenant's, not the credential's.
+    lake_cache: dict[str, dict[str, Any]] = {}
+    accounts = []
+    for t, c in clouds:
+        key = str(t["platform"])
+        if key not in lake_cache:
+            lake_cache[key] = _aws_lake_counts(lake_root, key, AWS_CLOUDTRAIL_SOURCE,
+                                               AWS_CLOUDTRAIL_PRODUCER)
+        accounts.append(_aws_account_entry(t, c, lake_root, lake_cache[key]))
+    states = [a["state"] for a in accounts]
+    if "unmeasurable" in states and all(s == "unmeasurable" for s in states):
+        state, reason = "unmeasurable", accounts[0]["reason"]
+    elif "enabled_producing" in states:
+        state, reason = "enabled_producing", None
+    elif "enabled_silent" in states:
+        state, reason = "enabled_silent", None
+    elif "unmeasurable" in states:
+        state, reason = "unmeasurable", "at least one AWS account could not be measured"
+    elif "present_no_ingest" in states:
+        state, reason = "present_no_ingest", None
+    else:
+        state, reason = "absent", None
+    return {
+        "as_of": as_of, "tenant": chosen, "accounts": accounts, "count": len(accounts),
+        "state": state, "state_label": AWS_STATE_LABELS.get(state, state), "reason": reason,
+        "probe_calls": ["cloudtrail:DescribeTrails(includeShadowTrails=True)", "cloudtrail:GetTrailStatus",
+                        "guardduty:ListDetectors", "securityhub:DescribeHub",
+                        "iam:GetAccountPasswordPolicy"],
+        "lake_root": lake_root,
+        "counts": {k: states.count(k) for k in AWS_STATE_LABELS if states.count(k)},
+        "unmeasured": [u for a in accounts for u in a["unmeasured"]],
+    }
+
+
 @router.get("/capability")
 def capability():
     """The capability floor: what this suite does, and explicitly what it does NOT do.
@@ -1427,6 +2151,19 @@ def capability():
     }
 
 
+@router.get("/aws")
+def aws(tenant: Optional[str] = None):
+    """The AWS control-plane panel — a LIVE probe in three states, never a config claim, never a zero.
+
+    Tenant is required and has no default, like every other per-tenant read. The probe is bounded by
+    ``PSEC_AWS_PROBE_TIMEOUT`` and cached for ``PSEC_AWS_PROBE_TTL``; a refusal or a timeout renders
+    ``UNMEASURABLE: <reason>``, never an empty panel and never a zero.
+    """
+    reg = _load_registry()
+    chosen = _tenant_or_refuse(tenant, reg["tenants"])
+    return _aws_panel(chosen, reg)
+
+
 @router.get("/meta")
 def meta():
     """What every other route is reading — the provenance panel, and the honest source census."""
@@ -1447,6 +2184,16 @@ def meta():
         "lake": {"root": lake["lake_root"], "provenance": lake["provenance"],
                  "feeds": len(lake["feeds"])},
         "retirement": {"path": post["path"], "provenance": post["provenance"]},
+        # The AWS panel's provenance, WITHOUT running it: /meta is fetched on every page load and a
+        # ~35-call AWS probe behind it is exactly the "blocking the page" this panel must avoid. The
+        # live probe runs on /aws itself, and its result is cached for PSEC_AWS_PROBE_TTL.
+        "aws": {"endpoint": "/aws?tenant=<slug>", "probe": "live (read-only)",
+                "calls": ["cloudtrail:DescribeTrails(includeShadowTrails=True)",
+                          "cloudtrail:GetTrailStatus", "guardduty:ListDetectors",
+                          "securityhub:DescribeHub", "iam:GetAccountPasswordPolicy"],
+                "lake_producer": AWS_CLOUDTRAIL_PRODUCER,
+                "note": "this page does not run the probe; the AWS panel does, and it renders "
+                        "UNMEASURABLE:<reason> rather than a zero"},
         "capability": {"path": cap["path"], "provenance": cap["provenance"],
                        "out_of_scope": sum(1 for r in cap["rows"] if r["state"] == "out_of_scope")},
         "unmeasured": (reg["unmeasured"] + det["unmeasured"] + lake["unmeasured"]

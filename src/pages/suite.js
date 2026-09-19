@@ -79,6 +79,9 @@
             }),
             h("tr", null, h("td", null, "lake"), h("td", null, (m.lake || {}).root || "—"), h("td", null, ((m.lake || {}).feeds) + " feeds (" + ((m.lake || {}).provenance) + ")")),
             h("tr", null, h("td", null, "retirement"), h("td", null, (m.retirement || {}).path || "—"), h("td", null, String((m.retirement || {}).provenance))),
+            h("tr", null, h("td", null, "aws (probe)"),
+              h("td", null, (m.aws || {}).endpoint || "—"),
+              h("td", null, (m.aws || {}).probe || "—")),
             h("tr", null, h("td", null, "capability"), h("td", null, (m.capability || {}).path || "—"), h("td", null, String((m.capability || {}).provenance) + " · " + ((m.capability || {}).out_of_scope == null ? "unmeasured" : (m.capability.out_of_scope + " out of scope")))),
             h("tr", null, h("td", null, "boards"), h("td", null, "kanban"), h("td", null, (m.boards || []).join(", "))),
             h("tr", null, h("td", null, "synthetic rows"), h("td", null, (t.synthetic_rows || []).join(", ")), h("td", null, "never folded into a tenant"))),
@@ -88,6 +91,7 @@
       h("div", { key: "scope-" + current },
         h(CapabilityPanel),
         h(LivenessPanel, { tenant: current, onError: null }),
+        h(AwsPanel, { tenant: current }),
         h(FindingsPanel, { tenant: current }),
         h(CrossPanel, { tenant: current }),
         h(CoveragePanel, { tenant: current }),
@@ -208,6 +212,108 @@
               : (x.streams_present.length + " / " + x.streams_expected.length)),
             h("td", null, num(x.rules_enabled), " / ", x.rules_total == null ? h("span", { className: "mc-muted" }, "unmeasured") : num(x.rules_total)));
         }))));
+  }
+
+  /* The AWS control-plane panel.
+   *
+   * WHY IT LEADS NEAR THE TOP. MEASURED 2026-09-19 (cards t_6dc8c120 + t_31c93028): the account has a
+   * real multi-region CloudTrail and GuardDuty detectors in six regions, and this dashboard rendered
+   * NONE of it — the string `aws` did not occur anywhere in the bundle. A surface a reader would
+   * expect to be covered and cannot see is the defect class this suite exists to remove.
+   *
+   * WHAT IT RENDERS, and what it must never render:
+   *   * a LIVE PROBE's answer, never the registry's claim (the claim is shown under `declared`,
+   *     beside the measurement, and is labelled as a claim);
+   *   * one of FOUR named states per surface, and a bare `0` is never one of them:
+   *       enabled and producing   — the object EXISTS and rows are in the lake for its producer
+   *       enabled but silent      — the object exists and its producer exists, and 0 rows landed
+   *       present, no source      — the object exists and NOTHING ingests it (presence is not
+   *                                 ingestion: no source reads the trail's S3 bucket, and no
+   *                                 producer carries GuardDuty findings at all)
+   *       ABSENT                  — measured absent (no trail, not subscribed, NoSuchEntity), which
+   *                                 is a stated absence and not a zero
+   *       UNMEASURABLE:<reason>   — the probe was refused, timed out, or could not be run at all
+   *   * `lake_rows` is null when the lake could not be read, and it is rendered as "unmeasured" —
+   *     never as 0. A measured 0 renders as a WARN pill ("0 rows — silent"), so a reader cannot
+   *     mistake "the source ran and landed nothing" for "I could not measure it".
+   */
+  var AWS_TONE = { enabled_producing: "", enabled_silent: "mc-pill-warn",
+                   no_source: "mc-pill-me", configured: "mc-pill-me",
+                   absent: "mc-pill-warn", unmeasurable: "mc-pill-err",
+                   present_no_ingest: "mc-pill-me" };
+
+  function AwsPanel(props) {
+    var p = usePoll("/aws?tenant=" + encodeURIComponent(props.tenant), 300000);
+    var d = p.state.data;
+    if (p.state.error && !d) return h(PsPanel, { title: "AWS control plane — live probe", error: p.state.error });
+    if (!d) return h(PsPanel, { title: "AWS control plane — live probe", sub: "probing the AWS control plane (bounded; may take a moment)" }, h("div", { className: "mc-muted" }, "…"));
+
+    var accounts = d.accounts || [];
+    var lakeRows = function (r) {
+      // ⛔ THE ONE RULE: never a bare zero. A not-measured count is "unmeasured"; a measured zero
+      // is rendered WITH its meaning, as a warn pill — never as a lone number.
+      if (r.lake_rows == null) return h("span", { className: "mc-muted" }, "unmeasured" + (r.lake_reason ? " (" + r.lake_reason + ")" : ""));
+      if (r.lake_rows === 0) return h(Pill, { kind: "mc-pill-warn" }, "0 rows — silent");
+      return h("span", null, num(r.lake_rows) + " rows" + (r.lake_last_event ? " · last " + hhmm(r.lake_last_event) : ""));
+    };
+
+    return h(PsPanel, {
+      title: "AWS control plane — a LIVE probe, in stated states",
+      sub: "content decided by the probe, not by the registry's claim · presence and ingestion are separate facts · a zero never stands in for a state",
+      as_of: d.as_of, unmeasured: d.unmeasured,
+      right: h("span", { className: "mc-row-m" },
+        h(Pill, { kind: AWS_TONE[d.state] == null ? "mc-pill-err" : AWS_TONE[d.state] },
+          d.state_label || d.state || "unmeasurable"),
+        h(Pill, { kind: "mc-pill-me" }, d.count + " AWS account(s) in scope"))
+    },
+      (d.probe_calls || []).length ? h("div", { className: "mc-muted" }, "probe calls (read-only): " + (d.probe_calls || []).join(" · ")) : null,
+      d.reason ? h("div", { className: "mc-err" }, "state: " + (d.state_label || d.state) + " — " + d.reason) : null,
+
+      accounts.map(function (a) {
+        var pr = a.probe || {}, decl = a.declared || {};
+        return h("div", { key: a.platform + "|" + (decl.account || ""), className: "ps-aws-block" },
+          h("div", { className: "mc-row-t" },
+            "AWS " + (decl.account || "account unmeasured") + "  ·  tenant " + a.platform + "  ",
+            h(Pill, { kind: AWS_TONE[a.state] == null ? "mc-pill-err" : AWS_TONE[a.state] }, a.state_label || a.state)),
+          h("div", { className: "mc-row-m" },
+            h("span", null, "probe: "),
+            h(Pill, { kind: pr.status === "ok" ? "" : "mc-pill-err" }, pr.status || "unmeasurable"),
+            h("span", { className: "mc-muted" },
+              (a.identity && a.identity.arn ? " as " + a.identity.arn : " (identity unmeasured)")
+              + " · " + ((pr.regions_probed || []).length) + " region(s) probed"
+              + " · iam users: " + (pr.iam_users == null ? "unmeasured" : num(pr.iam_users))
+              + " · cache: " + ((pr.cache || {}).cached ? "hit, " + dur((pr.cache || {}).age_seconds) + " old (ttl " + (pr.cache || {}).ttl_seconds + "s)" : "fresh read in " + ((pr.cache || {}).duration_s == null ? "?" : (pr.cache || {}).duration_s + "s"))
+              + " · timeout " + pr.timeout_s + "s")),
+          pr.reason ? h("div", { className: "mc-err" }, "UNMEASURABLE: " + pr.reason) : null,
+          h("div", { className: "mc-muted" },
+            "the registry declares (a CLAIM, never this panel's answer): " + (decl.credential_ref || "no credential ref")
+            + " · access " + (decl.access || "unmeasured")
+            + " · sources declared " + ((decl.sources || []).join(", ") || "none")
+            + " · account_verified " + String(decl.account_verified)),
+          h("div", { className: "mc-muted" },
+            "lake: producer=" + (a.lake.producer || "unmeasured") + " in " + (a.lake.source || "unmeasured")
+            + " under " + (a.lake.root || "no lake_root resolved")
+            + " — rows " + (a.lake.rows == null ? "unmeasured (" + (a.lake.reason || "not read") + ")" : num(a.lake.rows))),
+          h("table", { className: "mc-table" },
+            h("thead", null, h("tr", null,
+              h("th", null, "surface"), h("th", null, "state"), h("th", null, "probe"),
+              h("th", null, "ingestion"), h("th", null, "what that means"))),
+            h("tbody", null, (a.surfaces || []).map(function (r) {
+              return h("tr", { key: r.id, className: r.state === "absent" || r.state === "unmeasurable" ? "ps-stale" : "" },
+                h("td", null, h("div", null, r.surface), h("span", { className: "mc-muted" }, r.id)),
+                h("td", null, h(Pill, { kind: AWS_TONE[r.state] == null ? "mc-pill-err" : AWS_TONE[r.state] },
+                  r.state_label || r.state)),
+                h("td", { className: "mc-muted" }, (r.probe_calls || []).join(" · ")),
+                h("td", null, lakeRows(r)),
+                h("td", null,
+                  h("div", null, r.finding || h("span", { className: "mc-muted" }, "unmeasured")),
+                  (r.regions_present || []).length
+                    ? h("div", { className: "mc-muted" }, "present in: " + (r.regions_present || []).join(", ")
+                        + (((r.regions_empty || []).length) ? " · EMPTY in: " + (r.regions_empty || []).join(", ") : ""))
+                    : null,
+                  (r.unmeasured || []).length ? h("div", { className: "mc-muted" }, "unmeasured: " + (r.unmeasured || []).join(" · ")) : null));
+            }))));
+      }));
   }
 
   function FindingsPanel(props) {
