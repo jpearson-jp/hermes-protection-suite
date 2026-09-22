@@ -238,9 +238,17 @@
         h("table", { className: "mc-table" },
           h("tbody", null,
             h("tr", null, h("td", null, "registry"), h("td", null, (m.registry || {}).root || "—"), h("td", null, ((m.registry || {}).tenants) + " tenants (" + ((m.registry || {}).provenance) + ")")),
-            h("tr", null, h("td", null, "detections"), h("td", null, (m.detections || {}).path || "—"), h("td", null, ((m.detections || {}).rules) + " rules (" + ((m.detections || {}).provenance) + ")")),
+            ((m.detections || {}).catalogs || []).map(function (c) {
+              return h("tr", { key: "cat-" + c.role },
+                h("td", null, "detections — " + c.role + " catalog"),
+                h("td", null, (c.path || "—") + " · " + (c.engine || "engine unmeasured") + " · lake " + (c.lake || "unmeasured")),
+                h("td", null, c.readable ? (c.count + " rules (" + c.provenance + ")") : "unmeasured — not zero"));
+            }),
             h("tr", null, h("td", null, "lake"), h("td", null, (m.lake || {}).root || "—"), h("td", null, ((m.lake || {}).feeds) + " feeds (" + ((m.lake || {}).provenance) + ")")),
             h("tr", null, h("td", null, "retirement"), h("td", null, (m.retirement || {}).path || "—"), h("td", null, String((m.retirement || {}).provenance))),
+            h("tr", null, h("td", null, "aws (probe)"),
+              h("td", null, (m.aws || {}).endpoint || "—"),
+              h("td", null, (m.aws || {}).probe || "—")),
             h("tr", null, h("td", null, "capability"), h("td", null, (m.capability || {}).path || "—"), h("td", null, String((m.capability || {}).provenance) + " · " + ((m.capability || {}).out_of_scope == null ? "unmeasured" : (m.capability.out_of_scope + " out of scope")))),
             h("tr", null, h("td", null, "boards"), h("td", null, "kanban"), h("td", null, (m.boards || []).join(", "))),
             h("tr", null, h("td", null, "synthetic rows"), h("td", null, (t.synthetic_rows || []).join(", ")), h("td", null, "never folded into a tenant"))),
@@ -250,6 +258,7 @@
       h("div", { key: "scope-" + current },
         h(CapabilityPanel),
         h(LivenessPanel, { tenant: current, onError: null }),
+        h(AwsPanel, { tenant: current }),
         h(FindingsPanel, { tenant: current }),
         h(CrossPanel, { tenant: current }),
         h(CoveragePanel, { tenant: current }),
@@ -372,6 +381,157 @@
         }))));
   }
 
+  /* The AWS control-plane panel.
+   *
+   * WHY IT LEADS NEAR THE TOP. MEASURED 2026-09-19 (cards t_6dc8c120 + t_31c93028): the account has a
+   * real multi-region CloudTrail and GuardDuty detectors in six regions, and this dashboard rendered
+   * NONE of it — the string `aws` did not occur anywhere in the bundle. A surface a reader would
+   * expect to be covered and cannot see is the defect class this suite exists to remove.
+   *
+   * WHAT IT RENDERS, and what it must never render:
+   *   * a LIVE PROBE's answer, never the registry's claim (the claim is shown under `declared`,
+   *     beside the measurement, and is labelled as a claim);
+   *   * one of FOUR named states per surface, and a bare `0` is never one of them:
+   *       enabled and producing   — the object EXISTS and rows are in the lake for its producer
+   *       enabled but silent      — the object exists and its producer exists, and 0 rows landed
+   *       present, no source      — the object exists and NOTHING ingests it (presence is not
+   *                                 ingestion: no source reads the trail's S3 bucket, and no
+   *                                 producer carries GuardDuty findings at all)
+   *       ABSENT                  — measured absent (no trail, not subscribed, NoSuchEntity), which
+   *                                 is a stated absence and not a zero
+   *       UNMEASURABLE:<reason>   — the probe was refused, timed out, or could not be run at all
+   *   * `lake_rows` is null when the lake could not be read, and it is rendered as "unmeasured" —
+   *     never as 0. A measured 0 renders as a WARN pill ("0 rows — silent"), so a reader cannot
+   *     mistake "the source ran and landed nothing" for "I could not measure it". ONE function
+   *     (`lakeCell`) renders every count — the account's lake line and the surface table's ingestion
+   *     cell alike — because two paths is how the account line came to render a measured 0 bare.
+   *   * the ACCOUNT's own state (`present_no_ingest`, emitted when a surface is present and nothing
+   *     ingests it) is rendered through the backend's `state_label`; no state the state machine can
+   *     emit is rendered as a raw machine token.
+   *   * `details` is RENDERED, not merely carried: the CloudTrail trail list, with `IsLogging` from
+   *     GetTrailStatus — a trail that is PRESENT and not logging is a finding the state cell cannot
+   *     express on its own — and the "no source reads the trail's S3 bucket" note.
+   */
+  var AWS_TONE = { enabled_producing: "", enabled_silent: "mc-pill-warn",
+                   no_source: "mc-pill-me", configured: "mc-pill-me",
+                   absent: "mc-pill-warn", unmeasurable: "mc-pill-err",
+                   present_no_ingest: "mc-pill-me" };
+
+  function AwsPanel(props) {
+    var p = usePoll("/aws?tenant=" + encodeURIComponent(props.tenant), 300000);
+    var d = p.state.data;
+    if (p.state.error && !d) return h(PsPanel, { title: "AWS control plane — live probe", error: p.state.error });
+    if (!d) return h(PsPanel, { title: "AWS control plane — live probe", sub: "probing the AWS control plane (bounded; may take a moment)" }, h("div", { className: "mc-muted" }, "…"));
+
+    var accounts = d.accounts || [];
+    // ⛔ THE ONE RULE: never a bare zero. A not-measured count is "unmeasured"; a measured zero is
+    // rendered WITH its meaning, as a warn pill — never as a lone number. ONE function, because the
+    // ACCOUNT lake line and the surface table's ingestion cell are the same fact at two scopes: they
+    // diverged once (the account line rendered a measured 0 as "rows 0" while the row below it
+    // carried the meaning), and a second rendering path is how that happens.
+    var lakeCell = function (rows, reason, lastEvent) {
+      if (rows == null) return h("span", { className: "mc-muted" }, "unmeasured" + (reason ? " (" + reason + ")" : ""));
+      if (rows === 0) return h(Pill, { kind: "mc-pill-warn" }, "0 rows — silent");
+      return h("span", null, num(rows) + " rows" + (lastEvent ? " · last " + hhmm(lastEvent) : ""));
+    };
+    var lakeRows = function (r) { return lakeCell(r.lake_rows, r.lake_reason, r.lake_last_event); };
+    // The trail list the probe measured, rendered because the payload carries it AND the suite
+    // asserts it. `IsLogging` comes from cloudtrail:GetTrailStatus — the probe goes out of its way to
+    // read it (aws_audit.py had read the wrong key), and a trail that is PRESENT but not logging is a
+    // fact the state cell cannot express on its own.
+    //
+    // ⛔ THE KEYS ARE THE PROBE'S, MEASURED — not the card's paraphrase. The live payload carries
+    // `IsMultiRegionTrail` (DescribeTrails' own name: only `IsMultiTrail` would render a MEASURED
+    // boolean as "unmeasured"), and `IsLogging_error` is an OBJECT (`{error, reason}`), which
+    // string-concatenating renders as "[object Object]".
+    var errText = function (e) {
+      if (e == null || e === "") return "";
+      if (typeof e === "string") return e.length > 160 ? e.slice(0, 160) + "…" : e;
+      var s = String(e.reason || e.error || JSON.stringify(e));
+      return s.length > 160 ? s.slice(0, 160) + "…" : s;
+    };
+    var trailsCell = function (r) {
+      var tr = ((r.details || {}).trails) || [];
+      if (!tr.length) return null;
+      return h("div", { className: "mc-muted" },
+        "trails the probe measured:",
+        h("div", null, tr.map(function (t) {
+          var multi = (t.IsMultiRegionTrail == null ? t.IsMultiTrail : t.IsMultiRegionTrail);
+          var why = errText(t.IsLogging_error);
+          var logging = t.IsLogging === true ? h("span", null, "logging")
+            : (t.IsLogging === false ? h(Pill, { kind: "mc-pill-warn" }, "NOT logging")
+              : h("span", { className: "mc-muted" }, "logging unmeasured" + (why ? ": " + why : "")));
+          return h("div", { key: (t.Name || "trail") + "|" + (t.region || "") },
+            "trail " + (t.Name || "name not returned") + " — " + (t.region || "region unmeasured")
+            + " · home " + (t.HomeRegion || "unmeasured")
+            + " · multi-region " + (multi === true ? "yes" : (multi === false ? "no" : "unmeasured"))
+            + " · s3 " + (t.S3BucketName || "unmeasured") + " · ",
+            logging);
+        })),
+        ((r.details || {}).trail_s3_ingest || "").length
+          ? h("div", { className: "mc-muted" }, (r.details || {}).trail_s3_ingest) : null);
+    };
+
+    return h(PsPanel, {
+      title: "AWS control plane — a LIVE probe, in stated states",
+      sub: "content decided by the probe, not by the registry's claim · presence and ingestion are separate facts · a zero never stands in for a state",
+      as_of: d.as_of, unmeasured: d.unmeasured,
+      right: h("span", { className: "mc-row-m" },
+        h(Pill, { kind: AWS_TONE[d.state] == null ? "mc-pill-err" : AWS_TONE[d.state] },
+          d.state_label || d.state || "unmeasurable"),
+        h(Pill, { kind: "mc-pill-me" }, d.count + " AWS account(s) in scope"))
+    },
+      (d.probe_calls || []).length ? h("div", { className: "mc-muted" }, "probe calls (read-only): " + (d.probe_calls || []).join(" · ")) : null,
+      d.reason ? h("div", { className: "mc-err" }, "state: " + (d.state_label || d.state) + " — " + d.reason) : null,
+
+      accounts.map(function (a) {
+        var pr = a.probe || {}, decl = a.declared || {};
+        return h("div", { key: a.platform + "|" + (decl.account || ""), className: "ps-aws-block" },
+          h("div", { className: "mc-row-t" },
+            "AWS " + (decl.account || "account unmeasured") + "  ·  tenant " + a.platform + "  ",
+            h(Pill, { kind: AWS_TONE[a.state] == null ? "mc-pill-err" : AWS_TONE[a.state] }, a.state_label || a.state)),
+          h("div", { className: "mc-row-m" },
+            h("span", null, "probe: "),
+            h(Pill, { kind: pr.status === "ok" ? "" : "mc-pill-err" }, pr.status || "unmeasurable"),
+            h("span", { className: "mc-muted" },
+              (a.identity && a.identity.arn ? " as " + a.identity.arn : " (identity unmeasured)")
+              + " · " + ((pr.regions_probed || []).length) + " region(s) probed"
+              + " · iam users: " + (pr.iam_users == null ? "unmeasured" : num(pr.iam_users))
+              + " · cache: " + ((pr.cache || {}).cached ? "hit, " + dur((pr.cache || {}).age_seconds) + " old (ttl " + (pr.cache || {}).ttl_seconds + "s)" : "fresh read in " + ((pr.cache || {}).duration_s == null ? "?" : (pr.cache || {}).duration_s + "s"))
+              + " · timeout " + pr.timeout_s + "s")),
+          pr.reason ? h("div", { className: "mc-err" }, "UNMEASURABLE: " + pr.reason) : null,
+          h("div", { className: "mc-muted" },
+            "the registry declares (a CLAIM, never this panel's answer): " + (decl.credential_ref || "no credential ref")
+            + " · access " + (decl.access || "unmeasured")
+            + " · sources declared " + ((decl.sources || []).join(", ") || "none")
+            + " · account_verified " + String(decl.account_verified)),
+          h("div", { className: "mc-muted" },
+            "lake: producer=" + (a.lake.producer || "unmeasured") + " in " + (a.lake.source || "unmeasured")
+            + " under " + (a.lake.root || "no lake_root resolved") + " — ",
+            lakeCell(a.lake.rows, a.lake.reason, a.lake.last_event)),
+          h("table", { className: "mc-table" },
+            h("thead", null, h("tr", null,
+              h("th", null, "surface"), h("th", null, "state"), h("th", null, "probe"),
+              h("th", null, "ingestion"), h("th", null, "what that means"))),
+            h("tbody", null, (a.surfaces || []).map(function (r) {
+              return h("tr", { key: r.id, className: r.state === "absent" || r.state === "unmeasurable" ? "ps-stale" : "" },
+                h("td", null, h("div", null, r.surface), h("span", { className: "mc-muted" }, r.id)),
+                h("td", null, h(Pill, { kind: AWS_TONE[r.state] == null ? "mc-pill-err" : AWS_TONE[r.state] },
+                  r.state_label || r.state)),
+                h("td", { className: "mc-muted" }, (r.probe_calls || []).join(" · ")),
+                h("td", null, lakeRows(r)),
+                h("td", null,
+                  h("div", null, r.finding || h("span", { className: "mc-muted" }, "unmeasured")),
+                  trailsCell(r),
+                  (r.regions_present || []).length
+                    ? h("div", { className: "mc-muted" }, "present in: " + (r.regions_present || []).join(", ")
+                        + (((r.regions_empty || []).length) ? " · EMPTY in: " + (r.regions_empty || []).join(", ") : ""))
+                    : null,
+                  (r.unmeasured || []).length ? h("div", { className: "mc-muted" }, "unmeasured: " + (r.unmeasured || []).join(" · ")) : null));
+            }))));
+      }));
+  }
+
   function FindingsPanel(props) {
     var [state, setState] = useState("");
     var path = "/findings?tenant=" + encodeURIComponent(props.tenant) + (state ? "&state=" + encodeURIComponent(state) : "");
@@ -419,6 +579,7 @@
               : h("span", { className: "mc-muted" }, "unmeasured")),
             h("td", null, r.device_id ? h("span", { title: r.subject || "" }, r.device_id.length > 22 ? r.device_id.slice(0, 22) + "…" : r.device_id) : "—"),
             h("td", null, h(Pill, { kind: r.lifecycle === "unrecognised_status" ? "mc-pill-err" : "" }, r.lifecycle),
+              r.archived ? h(Pill, { kind: "mc-pill-warn" }, "archived") : null,
               r.block_kind ? h("span", { className: "mc-muted" }, " " + r.block_kind) : null),
             h("td", null, dur(r.age_seconds)),
             h("td", null, r.stale ? h(Pill, { kind: "mc-pill-err" }, "stale") : h("span", { className: "mc-muted" }, "—")),
@@ -488,6 +649,8 @@
     if (!d) return h(PsPanel, { title: "Coverage matrix", sub: "loading" }, h("div", { className: "mc-muted" }, "…"));
     var rows = d.rows || [];
     var shadow = d.shadowed || [];
+    var cats = d.catalogs || [];
+    var endp = d.endpoint_catalog || {};
     var tenantCols = [];
     rows.forEach(function (r) {
       (r.cells || []).forEach(function (c) {
@@ -496,11 +659,13 @@
     });
     return h(PsPanel, {
       title: "Coverage matrix — detections x tenants",
-      sub: d.rules_total + " rules · " + d.tenants_total + " tenant(s) · coverage is a CLAIM; what is measured here is scope, enablement, maturity and waivers",
+      sub: d.rules_total + " rules in the PLATFORM catalog · " + d.tenants_total + " tenant(s) · coverage is a CLAIM; what is measured here is scope, enablement, maturity and waivers",
       as_of: d.as_of, unmeasured: d.unmeasured,
       right: h("span", { className: "mc-row-m" },
         h(Pill, { kind: d.detections_provenance === "scripts-store" ? "" : "mc-pill-warn" },
-          "rules: " + (d.detections_provenance || "none")),
+          "platform: " + (d.detections_provenance || "unmeasured")),
+        h(Pill, { kind: endp.readable ? "mc-pill-me" : "mc-pill-warn" },
+          "endpoint catalog: " + (endp.readable ? endp.count + " rules" : "unmeasured")),
         h(Pill, { kind: shadow.length ? "mc-pill-warn" : "" },
           "shadowed: " + (d.shadowed_rules_total == null ? "unmeasured" : d.shadowed_rules_total)),
         h(Pill, { kind: Object.keys(d.declared_only || {}).length ? "mc-pill-warn" : "" },
@@ -520,9 +685,33 @@
                 h(Pill, { kind: c.state === "enabled" ? "" : (c.state === "excluded" ? "mc-pill-me" : "mc-pill-warn") },
                   c.state + (c.state !== "excluded" ? " · " + c.maturity : "")));
             }));
-        }))) : h("div", { className: "mc-muted" }, "no detection index and/or no registry — the matrix cannot be built; that is not an empty matrix"),
+        }))) : h("div", { className: "mc-muted" }, "the PLATFORM catalog (psec-detections.json) and/or the registry could not be read — the matrix cannot be built; that is not an empty matrix. Any other catalog of the suite is reported below."),
+      cats.length ? h("div", { className: "ps-catalogs" },
+        h("div", { className: "mc-row-t" }, "the suite's catalogs — " + cats.length + " NAMED catalog(s), never one substituted for the other"
+          + (d.catalogs_rules_total == null ? "" : " · " + d.catalogs_rules_total + " distinct rule id(s) between them")),
+        h("table", { className: "mc-table" },
+          h("thead", null, h("tr", null,
+            h("th", null, "catalog"), h("th", null, "its own rule ids"), h("th", null, "engine"),
+            h("th", null, "lake"))),
+          h("tbody", null, cats.map(function (c) {
+            return h("tr", { key: c.role, className: c.readable ? "" : "ps-stale" },
+              h("td", null,
+                h(Pill, { kind: c.readable ? (c.role === "platform" ? "" : "mc-pill-me") : "mc-pill-warn" }, c.role),
+                h("div", { className: "mc-muted" }, c.name || ""),
+                h("div", { className: "mc-muted" }, (c.path || "—") + " (" + (c.provenance || "none") + ")")),
+              h("td", null,
+                c.readable
+                  ? h("div", null,
+                      h("span", null, c.count + " rule(s)"),
+                      h("div", { className: "mc-muted" }, (c.rules || []).join(", ")))
+                  : h(Pill, { kind: "mc-pill-warn" }, "unmeasured — not zero")),
+              h("td", { className: "mc-muted" }, c.engine || "unmeasured"),
+              h("td", { className: "mc-muted" },
+                (c.lake || "unmeasured") + (c.lake_source ? " · " + c.lake_source : "")));
+          }))),
+        h("div", { className: "mc-muted" }, d.comparability || "")) : null,
       shadow.length ? h("div", { className: "mc-err" },
-        "shadowed — live catalogs this matrix does NOT resolve, so their rules are neither listed above nor zero: " +
+        "shadowed — a LIVE catalog that is NEITHER of the suite's named catalogs, so its rules are neither listed above nor zero: " +
         shadow.map(function (s) {
           return s.rules.length + " rule(s) in " + s.path + " (" + s.provenance + "): " + s.rules.join(", ");
         }).join(" · ")) : null);

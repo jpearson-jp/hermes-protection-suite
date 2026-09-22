@@ -26,6 +26,11 @@
  * CSS is local. The contract's two rules are kept on this surface too: an unmeasured source renders
  * as `unmeasured` (never as a zero), and `all` is shown beside the sum of the rows so
  * `all != sum(rows)` stays visible.
+ *
+ * The AWS control-plane panel (t_a162169c, mirroring the web half's `AwsPanel` at t_7c560aaf) keeps
+ * the never-a-bare-zero rule in ONE place — `lakeCell` — which both the account line and the surface
+ * table's ingestion cell go through: a lake count renders as `unmeasured (<reason>)`, as
+ * `0 rows — silent`, or as a number, and there is no second path that could render it alone.
  */
 
 import {
@@ -130,6 +135,15 @@ function age(sec) {
   const h = Math.floor(m / 60)
   if (h < 24) return h + 'h ' + (m % 60) + 'm'
   return Math.floor(h / 24) + 'd ' + (h % 24) + 'h'
+}
+
+/** A timestamp as `MM-DD HH:MM`. Deliberately a SLICE, not a Date parse: the lake hands back
+ *  DuckDB's `YYYY-MM-DD HH:MM:SS` (no `T`, no zone) and `new Date()` on that form is implementation
+ *  defined. A string that does not look like a stamp is shown as it came, never dropped. */
+function stamp(v) {
+  if (v === null || v === undefined || v === '') return null
+  const m = String(v).match(/^(\d{4})-(\d{2})-(\d{2})[T ](\d{2}):(\d{2})/)
+  return m ? m[2] + '-' + m[3] + ' ' + m[4] + ':' + m[5] : String(v)
 }
 
 /** A tenant's own hue, derived from its name — same idea as the web page's banner, so the two
@@ -691,16 +705,27 @@ function ProvenancePanel() {
         children: [
           jsx('thead', { children: jsxs('tr', { children: ['source', 'provenance', 'path / root', 'counts'].map(h => jsx('th', { key: h, children: h })) }) }),
           jsx('tbody', {
-            children: ['registry', 'detections', 'lake', 'retirement'].map(k => {
+            children: ['registry', 'detections', 'lake', 'retirement', 'aws'].map(k => {
               const s = d[k] || {}
+              // The `aws` row is the ONE source this page does not read itself: /meta deliberately
+              // does not run the ~35-call probe (that would block every page load), so this row names
+              // the call surface and says who runs it — it is not a provenance of "unread".
+              const isAws = k === 'aws'
               return jsxs('tr', {
                 children: [
-                  jsx('td', { children: k }),
-                  jsx('td', { children: jsx(Pill, { tone: s.provenance && String(s.provenance).indexOf('live') >= 0 ? 'good' : null, children: words(s.provenance) }) }),
-                  jsx('td', { className: 'ps-mono', children: words(s.path || s.root) }),
-                  jsx('td', { children: words(s.tenants !== undefined ? s.tenants + ' tenants'
-                    : s.rules !== undefined ? s.rules + ' rules'
-                    : s.feeds !== undefined ? s.feeds + ' feeds' : null) })
+                  jsx('td', { children: isAws ? 'aws (probe)' : k }),
+                  jsx('td', { children: jsx(Pill, {
+                    tone: isAws ? 'mute' : (s.provenance && String(s.provenance).indexOf('live') >= 0 ? 'good' : null),
+                    children: isAws ? words(s.probe) : words(s.provenance)
+                  }) }),
+                  jsx('td', { className: 'ps-mono', children: words(isAws ? s.endpoint : (s.path || s.root)) }),
+                  jsx('td', {
+                    children: isAws
+                      ? words(s.lake_producer) + ' producer · the AWS panel runs the probe, not this page'
+                      : words(s.tenants !== undefined ? s.tenants + ' tenants'
+                        : s.rules !== undefined ? s.rules + ' rules'
+                          : s.feeds !== undefined ? s.feeds + ' feeds' : null)
+                  })
                 ]
               }, k)
             })
@@ -708,6 +733,190 @@ function ProvenancePanel() {
         ]
       }),
       jsxs('div', { className: 'ps-row-m', children: [jsx('span', { children: 'boards scanned: ' }), jsx('span', { className: 'ps-mono', children: words(d.boards) }), jsx('span', { children: ' · as of ' + words(d.as_of) })] }),
+      jsx(Unmeasured, { items: d.unmeasured })
+    ]
+  })
+}
+
+// ----------------------------------------------------------------------------- AWS control plane
+
+/** The probe's per-surface states, mapped to this surface's tones. An UNKNOWN state is `warn`, never
+ *  a silent default: a state this build does not know is a state the reader cannot read. */
+const AWS_TONE = {
+  enabled_producing: 'good',
+  enabled_silent: 'warn',
+  absent: 'warn',
+  unmeasurable: 'warn',
+  no_source: 'mute',
+  configured: 'mute',
+  present_no_ingest: 'mute'
+}
+
+/** The backend carries the human label with every row (`state_label`). The ACCOUNT-level roll-up
+ *  `present_no_ingest` has no entry in the backend's map yet, and it must not render as a raw token
+ *  — so the same words are carried here. A label the backend sends always wins. */
+const AWS_LABEL_FALLBACK = {
+  present_no_ingest: 'present — no source ingests it (presence is not ingestion)'
+}
+
+function awsTone(state) {
+  return Object.prototype.hasOwnProperty.call(AWS_TONE, state) ? AWS_TONE[state] : 'warn'
+}
+
+function awsLabel(row) {
+  const s = row && row.state
+  return (row && row.state_label) || AWS_LABEL_FALLBACK[s] || s || 'unmeasurable'
+}
+
+/** ⛔ THE ONE RULE, in ONE place: a lake count is NEVER a bare zero.
+ *    not measured  -> `unmeasured (<reason>)`
+ *    measured 0    -> `0 rows — silent`   (as a warn pill — the source ran and landed nothing)
+ *    > 0           -> the number, with the last event when the lake gave one
+ *  Both the account line and the surface table's ingestion cell go through this, so there is no
+ *  second path that could render a count on its own. */
+function lakeCell(props) {
+  const rows = props.rows
+  const reason = props.reason
+  const lastEvent = props.lastEvent
+  if (rows === null || rows === undefined || typeof rows !== 'number') {
+    return jsx('span', { className: 'ps-sub', children: 'unmeasured' + (reason ? ' (' + reason + ')' : '') })
+  }
+  if (rows === 0) return jsx(Pill, { tone: 'warn', children: '0 rows — silent' })
+  return jsx('span', { children: num(rows) + ' rows' + (lastEvent ? ' · last ' + (stamp(lastEvent) || '') : '') })
+}
+
+/** The AWS control-plane panel — the desktop face of the same shipped `/aws` route.
+ *
+ *  WHY IT EXISTS HERE TOO: the web half gained this panel and the app — the surface the owner
+ *  actually opens — did not, so the account's real multi-region CloudTrail and its GuardDuty
+ *  detectors were invisible in the app (t_7c560aaf / t_a162169c).
+ *
+ *  WHAT IT RENDERS, and what it must never render:
+ *    * the LIVE PROBE's answer, never the registry's claim (the claim is shown under `declared`,
+ *      labelled as a claim, beside the measurement);
+ *    * ONE of the named states per surface — `enabled_producing` / `enabled_silent` / `no_source` /
+ *      `absent` / `present_no_ingest` / `unmeasurable` — and never a bare `0` as one of them;
+ *    * `UNMEASURABLE: <reason>` when the probe was refused, timed out, or could not be run — never
+ *      an empty panel. Presence and ingestion are SEPARATE facts, so a trail that exists and lands
+ *      nothing is not the same reading as a trail whose rows could not be read.
+ */
+function AwsPanel(props) {
+  const q = useJson('/aws?tenant=' + encodeURIComponent(props.tenant), 300000)
+  const d = q.data || {}
+  const accounts = d.accounts || []
+  const head = 'AWS control plane — a LIVE probe, in stated states'
+  if (q.isError && !q.data) {
+    return jsxs(Sec, {
+      title: head,
+      sub: 'tenant=' + props.tenant,
+      right: jsx('button', { type: 'button', className: 'ps-btn', onClick: refreshAll, children: 'refresh' }),
+      children: [jsx('div', {
+        className: 'ps-err',
+        children: 'UNMEASURABLE: the /aws route could not be read ('
+          + (q.error && q.error.message ? q.error.message : String(q.error || 'request failed'))
+          + ') — this is not a claim that the account has no control plane'
+      })]
+    })
+  }
+  return jsxs(Sec, {
+    title: head,
+    sub: 'tenant=' + props.tenant + ' · content decided by the probe, not by the registry\'s claim'
+      + ' · presence and ingestion are separate facts · a zero never stands in for a state',
+    right: jsxs('div', {
+      className: 'ps-bar',
+      children: [
+        jsx(Pill, { tone: awsTone(d.state), children: awsLabel(d) }),
+        jsx(Pill, { children: words(d.count) + ' AWS account(s) in scope' }),
+        jsx('button', { type: 'button', className: 'ps-btn', onClick: refreshAll, children: 'refresh' })
+      ]
+    }),
+    children: [
+      jsx(QErr, { q: q.isError ? null : q, what: '/aws' }),
+      jsx(Loading, { q: q, what: '/aws (the probe is bounded; it may take a moment)' }),
+      d.reason ? jsx('div', { className: 'ps-err', children: 'state: ' + awsLabel(d) + ' — ' + words(d.reason) }) : null,
+      (d.probe_calls || []).length ? jsx('div', { className: 'ps-sub', children: 'probe calls (read-only): ' + (d.probe_calls || []).join(' · ') }) : null,
+      accounts.length ? accounts.map((a, ai) => {
+        const pr = a.probe || {}
+        const decl = a.declared || {}
+        const lake = a.lake || {}
+        const cache = pr.cache || {}
+        const regions = pr.regions_probed || []
+        return jsxs('div', {
+          className: 'ps-row',
+          children: [
+            jsxs('div', {
+              className: 'ps-row-m',
+              children: [
+                jsx('span', { className: 'ps-row-t', children: 'AWS ' + (decl.account ? String(decl.account) : 'account unmeasured') }),
+                jsx(Pill, { tone: awsTone(a.state), children: awsLabel(a) }),
+                jsx('span', { children: 'tenant ' + words(a.platform) })
+              ]
+            }),
+            jsxs('div', {
+              className: 'ps-row-m',
+              children: [
+                jsx('span', { children: 'probe:' }),
+                jsx(Pill, { tone: pr.status === 'ok' ? 'good' : 'warn', children: words(pr.status) }),
+                jsx('span', { className: 'ps-mono', title: regions.join(', ') || null, children: a.identity && a.identity.arn ? a.identity.arn : 'identity unmeasured' }),
+                jsx('span', { children: regions.length + ' region(s) probed' }),
+                jsx('span', { children: 'iam users: ' + (pr.iam_users === null || pr.iam_users === undefined ? 'unmeasured' : num(pr.iam_users)) }),
+                jsx('span', {
+                  children: 'cache: ' + (cache.cached
+                    ? 'hit, ' + age(cache.age_seconds) + ' old (ttl ' + words(cache.ttl_seconds) + 's)'
+                    : 'fresh read in ' + (cache.duration_s === null || cache.duration_s === undefined ? 'unmeasured' : cache.duration_s + 's'))
+                }),
+                jsx('span', { children: 'timeout ' + words(pr.timeout_s) + 's' })
+              ]
+            }),
+            pr.reason ? jsx('div', { className: 'ps-err', children: 'UNMEASURABLE: ' + words(pr.reason) }) : null,
+            jsx('div', {
+              className: 'ps-sub',
+              children: 'the registry declares (a CLAIM, never this panel\'s answer): ' + words(decl.credential_ref)
+                + ' · access ' + words(decl.access)
+                + ' · account_verified ' + words(decl.account_verified)
+                + ' · sources declared ' + ((decl.sources || []).join(', ') || 'none')
+            }),
+            jsxs('div', {
+              className: 'ps-sub',
+              children: [
+                'lake: producer=' + words(lake.producer) + ' in ' + words(lake.source)
+                  + ' under ' + words(lake.root) + ' — ',
+                jsx(lakeCell, { rows: lake.rows, reason: lake.reason, lastEvent: lake.last_event })
+              ]
+            }),
+            (a.surfaces || []).length ? jsxs('table', {
+              className: 'ps-tbl',
+              children: [
+                jsx('thead', { children: jsxs('tr', { children: ['surface', 'state', 'probe', 'ingestion', 'what that means'].map(h => jsx('th', { key: h, children: h })) }) }),
+                jsx('tbody', { children: (a.surfaces || []).map((r, i) => jsxs('tr', {
+                  children: [
+                    jsx('td', { children: jsxs('span', { children: [
+                      jsx('div', { children: words(r.surface) }),
+                      jsx('span', { className: 'ps-sub', children: words(r.id) })
+                    ] }) }),
+                    jsx('td', { children: jsx(Pill, { tone: awsTone(r.state), children: awsLabel(r) }) }),
+                    jsx('td', { className: 'ps-mono', children: (r.probe_calls || []).join(' · ') }),
+                    jsx('td', { children: jsx(lakeCell, { rows: r.lake_rows, reason: r.lake_reason, lastEvent: r.lake_last_event }) }),
+                    jsx('td', { children: [
+                      jsx('div', { children: r.finding || jsx('span', { className: 'ps-sub', children: 'unmeasured' }) }),
+                      (r.regions_present || []).length ? jsx('div', {
+                        className: 'ps-sub',
+                        children: 'present in: ' + (r.regions_present || []).join(', ')
+                          + ((r.regions_empty || []).length ? ' · EMPTY in: ' + (r.regions_empty || []).join(', ') : '')
+                      }) : null,
+                      (r.unmeasured || []).length ? jsx('div', { className: 'ps-sub', children: 'unmeasured: ' + (r.unmeasured || []).join(' · ') }) : null
+                    ] })
+                  ]
+                }, i)) })
+              ]
+            }) : jsx('div', { className: 'ps-empty', children: q.isLoading ? 'probing…' : 'the probe returned no surface row — read the unmeasured list, not a 0' })
+          ]
+        }, ai)
+      }) : jsx('div', {
+        className: 'ps-empty',
+        children: q.isLoading ? 'probing…'
+          : 'no AWS account in this scope — ' + words(d.reason || 'the registry declares no `cloud: aws` for this tenant')
+      }),
       jsx(Unmeasured, { items: d.unmeasured })
     ]
   })
@@ -736,8 +945,9 @@ function SuitePage() {
           jsx('div', { className: 'ps-h1', children: 'Protection Suite' }),
           jsx('div', {
             className: 'ps-sub',
-            children: 'tenant switcher · coverage matrix · finding queue · retirement board — reads the registry, the '
-              + 'catalog, the boards and the lake; every panel names what it could not measure'
+            children: 'tenant switcher · liveness · AWS control plane (live probe) · coverage matrix · finding queue · '
+              + 'retirement board — reads the registry, the catalog, the boards, the lake and the AWS control plane '
+              + 'itself; every panel names what it could not measure'
           }),
           jsx('div', { className: 'ps-spacer' }),
           jsx('button', { type: 'button', className: 'ps-btn', onClick: () => { haptic('tap'); refreshAll() }, children: 'refresh all' })
@@ -746,6 +956,7 @@ function SuitePage() {
       jsx(TenantSwitcher, { tenant, onPick: setTenant }),
       jsx(CapabilityPanel, {}),
       jsx(LivenessPanel, { tenant }),
+      jsx(AwsPanel, { tenant }),
       jsx(FindingsPanel, { tenant }),
       jsx(CrossPanel, {}),
       jsx(CoveragePanel, { tenant }),
@@ -773,7 +984,7 @@ function SuiteChip() {
 export default {
   id: ID,
   name: 'Protection Suite',
-  description: 'The multi-tenant security operator surface: tenant switcher with per-tenant liveness, the detection coverage matrix, the finding queue with the SOC lifecycle, the Sentinel/Defender retirement board and cross-tenant counts.',
+  description: 'The multi-tenant security operator surface: tenant switcher with per-tenant liveness, the AWS control plane as a live read-only probe in stated states, the detection coverage matrix, the finding queue with the SOC lifecycle, the Sentinel/Defender retirement board and cross-tenant counts.',
   defaultEnabled: true,
   register(ctx) {
     rest = (path, opts) => ctx.rest(path, opts)
