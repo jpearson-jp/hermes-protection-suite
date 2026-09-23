@@ -232,3 +232,19 @@ profile, and a user-source plugin absent from that profile's `plugins.enabled` m
 answer `404 {"detail":"Plugin not found"}`.
 
 The dashboard is loopback-only at `127.0.0.1:9119` by design; it is not published and must not be.
+
+### The acceptance pin — why `build.sh` can exit 1 on a byte you did not touch
+
+`desktop/plugin.js` is a **shipped** artifact, and the revision that has been **accepted** is a
+hand-maintained `PINNED=` literal in the desktop half's acceptance bundle
+(`/home/hermes/hermes-outbox/2026-09-18-protection-suite-desktop-half/verify.sh`, whose check 1
+compares that literal against the LIVE file). `build.sh` asserts that pin against the half it just
+built and **exits 1 with the exact line to write** when the two differ — because nothing else routes
+a change to this half into that bundle, and `t_a162169c` (2026-09-20) left the bundle's check 1 red
+for three days by shipping `22f9b591` without moving the pin (kanban `t_18e26664`).
+
+So: a card that changes `desktop/plugin.js` moves that pin **in the same change**, then re-runs
+`bash <bundle>/verify.sh`. The pin is deliberately **not** derived from the file — a pin that
+updates itself cannot catch an unreviewed change to a shipped artifact, which is the only thing it
+is for. `PS_PIN_BUNDLE=<dir>` points the check at another bundle; the copies are still materialized
+before the assertion, so a stale pin never leaves a half-delivered tree behind.

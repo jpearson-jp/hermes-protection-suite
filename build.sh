@@ -64,6 +64,7 @@ python3 -c "import ast,sys;ast.parse(open('$DIR/dashboard/plugin_api.py').read()
 #      the same .hermes-package.json marker shape) makes an app whose HERMES_HOME is this box pick
 #      the half up with no rescan. Harmless when the renderer lives on another machine.
 HALF="$HERE/desktop/plugin.js"
+HALF_SHA=""
 if [ -f "$HALF" ]; then
   cp "$HALF" "$DIR/dashboard/dist/desktop-plugin.js"
   echo "  + served copy of the desktop half: dashboard/dist/desktop-plugin.js ($(wc -c < "$DIR/dashboard/dist/desktop-plugin.js") bytes)"
@@ -79,8 +80,64 @@ if [ -f "$HALF" ]; then
   printf '{"package":"%s","source":"%s","sourceMtimeMs":%s}\n' "$NAME" "$HALF" "$MTIME_MS" \
     > "$HALF_DST/.hermes-package.json"
   echo "  materialized desktop half -> $HALF_DST  (app-level: every profile)"
+  HALF_SHA="$(sha256sum "$HALF" | cut -d' ' -f1)"
 fi
 echo
 echo "Next: enable '$NAME' in plugins.enabled for the root config AND every profile (a user-source"
 echo "plugin absent from a profile's enabled list makes that profile's app view answer 404), then"
 echo "restart the dashboard (plugin_api.py mounts its routes at startup only)."
+
+# ── THE ACCEPTANCE PIN ───────────────────────────────────────────────────────────────────────
+# desktop/plugin.js is a SHIPPED artifact — the app loads the bytes at
+# <hermes home>/desktop-plugins/<name>/plugin.js on the machine the renderer runs on — and the
+# revision that has been ACCEPTED is recorded as a hand-maintained PINNED= literal in the desktop
+# half's acceptance bundle (verify.sh, whose check 1 compares that literal to the LIVE file).
+# Nothing used to route a change to the bundle: t_a162169c (f70617a, 2026-09-20) shipped the AWS
+# panel as 22f9b591 and did not move the pin, so the bundle's check 1 read "sha256 is 22f9b591…,
+# expected 06d4ecbf…" for THREE DAYS before anyone ran the suite (t_18e26664).
+#
+# So the pin is asserted HERE, because build.sh is the one step every card that changes this half
+# runs — it is what materializes the two copies the suite's check 2 compares. The pin is NOT
+# derived from the file: a pin that updates itself would delete the check's whole purpose
+# (catching an unreviewed change to a shipped artifact). This fails LOUDLY and prints the exact
+# line to write; moving the pin stays a deliberate, reviewable act.
+PIN_BUNDLE="${PS_PIN_BUNDLE:-/home/hermes/hermes-outbox/2026-09-18-protection-suite-desktop-half}"
+if [ -n "$HALF_SHA" ]; then
+  PIN_FILE="$PIN_BUNDLE/verify.sh"
+  if [ ! -r "$PIN_FILE" ] && [ -d "$(dirname "$PIN_BUNDLE")" ]; then
+    echo "  FAIL  acceptance bundle MISSING: $PIN_FILE is not readable, but $(dirname "$PIN_BUNDLE")"
+    echo "        exists — so the bundle is expected on this box, and the shipped desktop half cannot"
+    echo "        be checked against its pin. Restore the bundle, or set PS_PIN_BUNDLE to point at it."
+    exit 1
+  elif [ ! -r "$PIN_FILE" ]; then
+    echo "  NOTE  acceptance pin NOT checked: $PIN_BUNDLE is not present on this machine."
+    echo "        (Set PS_PIN_BUNDLE to the bundle directory to have it checked.)"
+  else
+    PINNED=""
+    PINNED="$(grep -m1 -E '^PINNED="[0-9a-f]{64}"$' "$PIN_FILE" | cut -d'"' -f2)" || PINNED=""
+    if [ -z "$PINNED" ]; then
+      echo "  FAIL  acceptance pin UNREADABLE: no PINNED=\"<64 hex>\" line in $PIN_FILE"
+      exit 1
+    elif [ "$PINNED" = "$HALF_SHA" ]; then
+      echo "  pin ok: desktop/plugin.js sha256 == the acceptance bundle's PINNED ($PINNED)"
+    else
+      echo
+      echo "  ==============================================================================="
+      echo "  FAIL  ACCEPTANCE PIN STALE — desktop/plugin.js is NOT the revision the acceptance"
+      echo "        bundle accepts. The bundle's check 1 is RED as of this build."
+      echo "  ==============================================================================="
+      echo "    bundle : $PIN_FILE"
+      echo "    pinned : $PINNED"
+      echo "    built  : $HALF_SHA  ($(wc -c < "$HALF") bytes)"
+      echo
+      echo "    Every card that changes desktop/plugin.js MUST move that pin in the SAME change and"
+      echo "    then re-run the bundle:  bash $PIN_BUNDLE/verify.sh"
+      echo "    To move it, write exactly this line into the file above:"
+      echo
+      echo "      PINNED=\"$HALF_SHA\""
+      echo
+      echo "    build.sh exits 1 until that is done. This is a failure, not a warning."
+      exit 1
+    fi
+  fi
+fi
