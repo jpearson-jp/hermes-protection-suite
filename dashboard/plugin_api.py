@@ -92,8 +92,21 @@ router = APIRouter()
 FIVE_STREAMS = ("auth_events", "endpoint_metrics", "cloud_audit", "host_health", "findings")
 
 # Non-terminal = "open case" (04 §3.1: one status list, one definition, one place).
-SOC_STATES = ("new", "triaging", "contained", "false_positive", "resolved")
+SOC_STATES = ("new", "triaging", "contained", "false_positive", "resolved", "archived")
 OPEN_STATES = ("new", "triaging")
+# A SILENCING state carries NO verdict (contract §7). `archived` is one: a card taken off the board
+# was not adjudicated, so it is neither open nor closed. MEASURED 2026-09-23 (card t_be4443f9, arms
+# ARCH/ARCH2 against this file): mapping `archived -> resolved` rendered an archived card
+# `lifecycle: "resolved"` with `disposition: "resolved (disposition unrecorded)"`, incremented
+# `lifecycle_counts.resolved` and `cross.*.resolved` — a SILENCING act incrementing a CLOSURE KPI —
+# and read an archived card's free-text `result` as a disposition ("contained"), i.e. an
+# un-adjudicated card rendered as a contained incident. A silencing state is its OWN lifecycle value.
+SILENCED_STATES = ("archived",)
+# What an archived row's disposition reads: explicitly UNRECORDED, and deliberately NOT a string a
+# consumer matching `resolved` matches on (arm CMT measured that `resolved (disposition unrecorded)`
+# reads as RESOLVED to a substring consumer).
+SILENCED_DISPOSITION = ("archived (disposition unrecorded — a silencing act carries no verdict, "
+                        "contract §7)")
 
 # kanban card status -> SOC lifecycle state. The ledger is the kanban board (contract §7).
 CARD_TO_SOC = {
@@ -105,7 +118,7 @@ CARD_TO_SOC = {
     "blocked": "triaging",
     "review": "triaging",
     "done": "resolved",
-    "archived": "resolved",
+    "archived": "archived",
 }
 
 SEVERITIES = ("critical", "high", "medium", "low", "info")
@@ -957,8 +970,11 @@ def _read_findings() -> dict[str, Any]:
     ``_attribution`` never ran for it. MEASURED 2026-09-19T01:20:57–01:21:02Z: seven fixture-artefact
     `psec-gaps-detect` cards were archived by their adjudicating lane (card `t_2a666fa6`, "harness
     artefact, not a finding") and the queue's PSEC population fell **134 → 127**, with no disposition
-    recorded for any of the seven. The adjudications were sound; the STATE was the defect. The
-    status→lifecycle map below already reads `archived → resolved`; what was missing was the ROW.
+    recorded for any of the seven. The adjudications were sound; the STATE was the defect. What was
+    missing was the ROW — and, until 2026-09-23 (card t_be4443f9), the row was then labelled with a
+    CLOSURE it never earned: the status→lifecycle map read `archived → resolved`, so restoring the row
+    restored it as a resolved case and incremented the resolved KPI. It now reads `archived →
+    archived` (see ``SILENCED_STATES``), and an archived row carries no verdict.
 
     The scope predicate (tenant, lifecycle state)
     belongs to the caller and the row cap belongs AFTER it: a cap applied to the whole-estate read
@@ -1007,8 +1023,15 @@ def _read_findings() -> dict[str, Any]:
             created = _int_or_none(r["created_at"]) or 0
             age = max(0, _now() - created) if created else None
             last_touch = _int_or_none(r["last_heartbeat_at"]) or _int_or_none(r["completed_at"]) or created
-            stale = bool(age is not None and age > STALE_OPEN_SECONDS
-                         and soc in OPEN_STATES and (_now() - (last_touch or created)) > STALE_OPEN_SECONDS)
+            # `stale` is an OPEN-CASE signal, and the payload now SAYS so instead of leaving it to be
+            # inferred from a bare boolean. `stale_applicable` is whether staleness is defined for
+            # this row at all: a `done` or `archived` row has no case to go stale, so its
+            # `stale: false` reads NOT APPLICABLE, never "fresh". MEASURED 2026-09-23 (card
+            # t_be4443f9, arm STALE): the field name promised a property of the row and delivered a
+            # property of OPEN rows, with nothing in the payload saying which.
+            stale_applicable = soc in OPEN_STATES
+            stale = bool(stale_applicable and age is not None and age > STALE_OPEN_SECONDS
+                         and (_now() - (last_touch or created)) > STALE_OPEN_SECONDS)
             rows.append({
                 "id": r["id"],
                 "board": b["slug"],
@@ -1020,9 +1043,11 @@ def _read_findings() -> dict[str, Any]:
                 "detail": parsed["detail"],
                 "card_status": r["status"],
                 # `archived` is a SILENCING state for a finding, not a closure (contract §7), so the
-                # row is INCLUDED above and the record survives. This flag is what tells an archived
-                # row apart from a `done` one that reached the same `resolved` lifecycle: read off
-                # the ledger's own status column, never inferred and never defaulted.
+                # row is INCLUDED above and the record survives. This flag is the ledger's own status
+                # column read back verbatim — never inferred and never defaulted — and since
+                # 2026-09-23 (card t_be4443f9) it is no longer the ONLY thing that tells an archived
+                # row from a closed one: `lifecycle` now reads `archived` too, and the disposition is
+                # unrecorded. A consumer that only ever looked at `archived` still sees it.
                 "archived": r["status"] == "archived",
                 "lifecycle": soc,
                 "block_kind": r["block_kind"],
@@ -1032,6 +1057,10 @@ def _read_findings() -> dict[str, Any]:
                 "resolved_at": _iso(r["completed_at"]),
                 "age_seconds": age,
                 "stale": stale,
+                # Whether staleness is DEFINED for this row (see the block above). A consumer that
+                # reads only `stale` on a closed row is reading "not applicable"; this field is what
+                # lets it tell that apart from "fresh".
+                "stale_applicable": stale_applicable,
                 "disposition": _disposition(r["result"], r["run_summary"], soc),
                 "mttr_seconds": ((_int_or_none(r["completed_at"]) - created)
                                  if (_int_or_none(r["completed_at"]) and created) else None),
@@ -1065,7 +1094,14 @@ def _disposition(result: Optional[str], summary: Optional[str], soc: str) -> Opt
         Its own value deliberately: folding it into `false_positive` would tell rule-tuning to retune
         a rule that is working (MEASURED: ~400 of those 414 fallback summaries say benign/expected,
         only 14 say "false positive" in so many words).
+
+    ⛔ A SILENCED row has no verdict to read. For an `archived` card the free text is NOT a
+    disposition and is never consulted for one (contract §7): MEASURED 2026-09-23 (card t_be4443f9,
+    arm ARCH2), an archived card carrying `result="contained: …"` rendered as a CONTAINED incident.
+    So the gate comes FIRST — a silenced row is answered before `result`/`summary` are looked at.
     """
+    if soc in SILENCED_STATES:
+        return SILENCED_DISPOSITION
     text = result if (result or "").strip() else (summary or "")
     low = (text or "").lower()
     if "false positive" in low or "false_positive" in low or "false-positive" in low:
@@ -2401,6 +2437,17 @@ def findings(tenant: Optional[str] = None, state: Optional[str] = None,
 
     ``sort`` is an allowlist (04 §3.1): an unknown value is refused, not interpolated. So is
     ``state`` — an unrecognised lifecycle value is refused rather than quietly matching nothing.
+    ``archived`` IS a lifecycle value (a SILENCING state, contract §7): it is selectable here and it
+    renders as itself, never as a closure.
+
+    ⛔ THE FINDINGS ARE ALSO RECONCILED AGAINST THE CATALOGS, which nothing did before 2026-09-23
+    (card t_be4443f9): ``unmatched_rule_ids`` names every rule id carried by a filed finding that NO
+    readable catalog carries — a detector the suite does not admit to having. It is reported HERE and
+    not in ``coverage`` on purpose: ``coverage`` is a function of the registry and the two catalogs,
+    and the bench's arm B asserts that deleting a finding moves no section but ``findings``/``cross``.
+    A partial join (a catalog present-but-unreadable, a board that could not be read) reports
+    ``filed_findings_reconciled.state == "unmeasured"`` and keeps ``unmatched_rule_ids`` EMPTY — what
+    no READABLE catalog carries is not the same claim as what no catalog carries.
 
     Scope is applied in this order: read the whole population, attribute, filter tenant, filter
     state, THEN cap the page. The cap therefore bounds the RETURNED rows only; ``in_scope_total`` is
@@ -2444,6 +2491,81 @@ def findings(tenant: Optional[str] = None, state: Optional[str] = None,
     scope_predicate = "tenant=" + chosen
     if wanted:
         scope_predicate += " & state=" + str(state).strip()
+    # THE OTHER DIRECTION, and the one that was missing: a FILED FINDING reconciled against the
+    # catalogs. Registry -> catalog IS reconciled (declared_only, above); finding -> catalog was NOT,
+    # so a card filed under a rule id no catalog carries rendered as a normal finding and appeared in
+    # no note at all. MEASURED 2026-09-23 (card t_be4443f9, arm XREF): a card filed under
+    # `psec.not.in.any.catalog` was indistinguishable in the payload from one filed under a declared
+    # detector.
+    #
+    # ⛔ IT IS REPORTED HERE, IN `findings`, AND NOT IN `coverage` — deliberately. `coverage` is a
+    # function of the registry and the two catalogs, and the t_a6731507 bench's arm B asserts exactly
+    # that (delete the fixture finding and NO section but `findings`/`cross` may move). Hanging this
+    # join off `coverage` broke that control, and bending the control to admit it would have been the
+    # repair buying its own pass. A filed finding's rule id is a property of the FINDING POPULATION,
+    # so it is reported with it.
+    det = _detections()
+    readable_catalogs = [c for c in det["catalogs"] if c.get("readable")]
+    catalog_ids: set[str] = set()
+    for c in readable_catalogs:
+        catalog_ids |= set(c.get("rules") or [])
+    seen: dict[str, dict[str, Any]] = {}
+    rows_with_rule = 0
+    for r in rows:
+        rid = r.get("rule_id")
+        if not rid:
+            continue
+        rows_with_rule += 1
+        if str(rid) in catalog_ids:
+            continue
+        entry = seen.setdefault(str(rid), {"rule_id": str(rid), "findings": 0, "cards": []})
+        entry["findings"] += 1
+        if len(entry["cards"]) < 5:
+            entry["cards"].append(r["id"])
+    # A PARTIAL join is not a join. "No catalog carries this rule" is only established when EVERY
+    # catalog of the suite was readable and every board was read: otherwise the id may live in the
+    # index that could not be read, and naming it UNMATCHED would be the same false-positive class as
+    # a failed measurement rendered as a zero. MEASURED 2026-09-23 (the bench's `sub` shape, platform
+    # catalog ABSENT): `psec.auth.spike` — a rule the missing index carries — was named unmatched by a
+    # reconciliation that had only read the other catalog. So the ids seen over the readable catalogs
+    # are reported under a name that says exactly that, and `unmatched_rule_ids` stays empty.
+    complete = (len(readable_catalogs) == len(det["catalogs"])) and not data["unmeasured"]
+    unmatched = seen if complete else {}
+    partial = {} if complete else seen
+    reconciliation_state = "complete" if complete else "unmeasured"
+    if complete and unmatched:
+        unmeasured.append(
+            f"findings: {len(unmatched)} rule id(s) carried by FILED FINDINGS appear in NO readable "
+            "catalog — findings from a detector the suite does not declare: "
+            + "; ".join(f"{k} ({v['findings']} finding(s), e.g. {', '.join(v['cards'])})"
+                        for k, v in sorted(unmatched.items()))
+        )
+    if not complete:
+        why = []
+        for c in det["catalogs"]:
+            if not c.get("readable"):
+                why.append(f"catalog {c['path']} is "
+                           f"{'present but unreadable' if c['present'] else 'ABSENT'}")
+        why.extend(f"board {u}" for u in data["unmeasured"])
+        unmeasured.append(
+            "findings: the finding->catalog reconciliation is UNMEASURED — " + "; ".join(why)
+            + f". It read {len(readable_catalogs)} of {len(det['catalogs'])} catalogs and "
+            f"{len(data['boards_scanned'])} board(s), and "
+            + (f"{len(partial)} rule id(s) no READABLE catalog carries are reported under "
+               "`unmatched_in_readable_catalogs_only` — that is NOT a claim that no catalog carries "
+               "them: " + ", ".join(sorted(partial))
+               if partial else
+               "no rule id was left over on the reads it did make, which is not the same as none "
+               "being undeclared")
+        )
+    # PER ROW, so that "distinguishable in the payload" does not require a join: a row filed under a
+    # rule id no readable catalog carries says so on itself. `None` — not `False` — when the join is
+    # incomplete or the row carries no rule id at all: `False` would be a CLAIM, and the whole point
+    # of the state field is that an unmeasured join must not be read as one.
+    for r in rows:
+        rid = r.get("rule_id")
+        r["rule_in_catalog"] = (None if (not complete or not rid)
+                                else str(rid) in catalog_ids)
     return {
         "as_of": _as_of(),
         "tenant": chosen,
@@ -2462,6 +2584,34 @@ def findings(tenant: Optional[str] = None, state: Optional[str] = None,
         "unrecognised_status_count": counts["unrecognised_status"],
         "lifecycle_vocab": list(SOC_STATES),
         "open_states": list(OPEN_STATES),
+        "silenced_states": list(SILENCED_STATES),
+        # WHAT `stale` IS A PROPERTY OF, said in the payload rather than left to be inferred from the
+        # field name. MEASURED 2026-09-23 (card t_be4443f9, arm STALE): a 100-day-old resolved row
+        # read `stale: false` with nothing anywhere saying the false was "not applicable".
+        "stale_scope": "open_rows_only",
+        "stale_open_seconds": STALE_OPEN_SECONDS,
+        "stale_definition": (
+            "`stale` is an OPEN-CASE signal: true only for a row whose lifecycle is in "
+            "`open_states` AND whose `age_seconds` and time-since-last-touch both exceed "
+            "`stale_open_seconds`. `stale_applicable` is false on every closed or silenced row, so "
+            "`stale: false` there means NOT APPLICABLE, not fresh (contract §7). A row-level "
+            "untouched-for-N-seconds fact is `age_seconds`, which is reported for every row."
+        ),
+        "unmatched_rule_ids": unmatched,
+        "unmatched_rule_ids_count": len(unmatched),
+        # NOT a substitute for the above: ids no READABLE catalog carries while the join is
+        # incomplete. Named separately so a consumer cannot read it as "undeclared".
+        "unmatched_in_readable_catalogs_only": partial,
+        "unmatched_in_readable_catalogs_only_count": len(partial),
+        "filed_findings_reconciled": {
+            "state": reconciliation_state,
+            "scope": scope_predicate,
+            "catalogs_readable": len(readable_catalogs),
+            "catalogs_total": len(det["catalogs"]),
+            "rows_in_scope": len(rows),
+            "rows_with_rule_id": rows_with_rule,
+            "boards_scanned": data["boards_scanned"],
+        },
         "unmeasured": unmeasured,
     }
 
@@ -2485,11 +2635,15 @@ def cross():
     buckets: dict[str, dict[str, Any]] = {}
     for r in rows:
         b = buckets.setdefault(r["platform"], {"open": 0, "needs_human": 0, "resolved": 0,
-                                               "ages": [], "unrecognised": 0})
+                                               "silenced": 0, "ages": [], "unrecognised": 0})
         if r["lifecycle"] in OPEN_STATES:
             b["open"] += 1
         elif r["lifecycle"] == "resolved":
             b["resolved"] += 1
+        if r["lifecycle"] in SILENCED_STATES:
+            # A SILENCING act is its OWN bucket, never a closure (contract §7): MEASURED 2026-09-23
+            # (card t_be4443f9, arm ARCH) an archived card incremented `resolved` here.
+            b["silenced"] += 1
         if r["lifecycle"] == "unrecognised_status":
             b["unrecognised"] += 1
         if r["block_kind"] == "needs_input":
@@ -2500,7 +2654,7 @@ def cross():
     for t in reg["tenants"]:
         b = buckets.get(str(t["platform"]), {})
         row_unmeasured = ["streams: psec lake unwritten"]
-        if not any(b.get(k) for k in ("open", "resolved", "needs_human", "unrecognised")):
+        if not any(b.get(k) for k in ("open", "resolved", "silenced", "needs_human", "unrecognised")):
             row_unmeasured.append(
                 "no finding on any board attributes to this tenant — read that as 'nothing is "
                 "attributed', not as 'nothing happened'"
@@ -2531,6 +2685,7 @@ def cross():
         "needs_human": sum(1 for r in rows if r["block_kind"] == "needs_input"),
         "oldest_open_age_seconds": max([r["age_seconds"] or 0 for r in open_rows] or [0]) or None,
         "resolved": sum(1 for r in rows if r["lifecycle"] == "resolved"),
+        "silenced": sum(1 for r in rows if r["lifecycle"] in SILENCED_STATES),
         "unrecognised_status": sum(1 for r in rows if r["lifecycle"] == "unrecognised_status"),
         "maturity": None,
         "unmeasured": [],
@@ -2570,6 +2725,7 @@ def _cross_row(platform: str, label: str, b: dict[str, Any], is_tenant: bool,
         "needs_human": b.get("needs_human", 0),
         "oldest_open_age_seconds": max(ages) if ages else None,
         "resolved": b.get("resolved", 0),
+        "silenced": b.get("silenced", 0),
         "unrecognised_status": b.get("unrecognised", 0),
         "maturity": maturity,
         "unmeasured": list(unmeasured),

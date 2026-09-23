@@ -523,7 +523,10 @@ function CrossPanel() {
       rows.length || all ? jsxs('table', {
         className: 'ps-tbl',
         children: [
-          jsx('thead', { children: jsxs('tr', { children: ['tenant', 'open', 'needs human', 'oldest open', 'resolved', 'unrecognised'].map(h => jsx('th', { key: h, children: h })) }) }),
+          // contract §7: `silenced` is its OWN bucket, beside `resolved` — an archived card carries
+          // no verdict, so a silencing act must never be read as a closure. Without this column the
+          // app surface showed `resolved 5` and NOTHING about the 2 silenced cards (t_353897b3).
+          jsx('thead', { children: jsxs('tr', { children: ['tenant', 'open', 'needs human', 'oldest open', 'resolved', 'silenced', 'unrecognised'].map(h => jsx('th', { key: h, children: h })) }) }),
           jsx('tbody', {
             children: rows.map((r, i) => jsxs('tr', {
               children: [
@@ -532,6 +535,7 @@ function CrossPanel() {
                 jsx('td', { children: num(r.needs_human) }),
                 jsx('td', { children: r.oldest_open_age_seconds === null || r.oldest_open_age_seconds === undefined ? 'unmeasured' : age(r.oldest_open_age_seconds) }),
                 jsx('td', { children: num(r.resolved) }),
+                jsx('td', { children: num(r.silenced) }),
                 jsx('td', { children: num(r.unrecognised_status) })
               ]
             }, i))
@@ -548,6 +552,7 @@ function CrossPanel() {
               jsx('span', { children: 'open ' + num(all.open) }),
               jsx('span', { children: 'needs human ' + num(all.needs_human) }),
               jsx('span', { children: 'resolved ' + num(all.resolved) }),
+              jsx('span', { children: 'silenced ' + num(all.silenced) }),
               jsx('span', { children: 'oldest open ' + (all.oldest_open_age_seconds === null || all.oldest_open_age_seconds === undefined ? 'unmeasured' : age(all.oldest_open_age_seconds)) }),
               jsx('span', { children: 'all_equals_sum ' + words(d.all_equals_sum) }),
               jsx('span', { children: 'tenant_rows_equal_all ' + words(d.tenant_rows_equal_all) })

@@ -565,6 +565,10 @@
           return h("button", { key: s, className: "mc-btn" + (state === s ? " mc-btn-p" : ""), onClick: function () { setState(s); } }, "open: " + s);
         }),
         h("button", { className: "mc-btn" + (state === "resolved" ? " mc-btn-p" : ""), onClick: function () { setState("resolved"); } }, "resolved"),
+        // §7: `archived` is a SILENCING lifecycle value (SILENCED_STATES in plugin_api.py), accepted
+        // by the route's state allowlist and advertised in lifecycle_vocab. Without this button the
+        // silenced queue had no filter, so the 2 archived findings could not be isolated here.
+        h("button", { className: "mc-btn" + (state === "archived" ? " mc-btn-p" : ""), onClick: function () { setState("archived"); } }, "archived"),
         h("span", { className: "mc-muted" }, "boards: " + (d.boards_scanned || []).join(", "))),
       h("table", { className: "mc-table" },
         h("thead", null, h("tr", null,
@@ -615,7 +619,8 @@
       h("table", { className: "mc-table" },
         h("thead", null, h("tr", null,
           h("th", null, "tenant"), h("th", null, "open"), h("th", null, "needs human"),
-          h("th", null, "oldest open"), h("th", null, "resolved"), h("th", null, "unrecognised"),
+          h("th", null, "oldest open"), h("th", null, "resolved"), h("th", null, "silenced"),
+          h("th", null, "unrecognised"),
           h("th", null, "maturity"), h("th", null, "unmeasured"))),
         h("tbody", null,
           rows.map(function (r) {
@@ -627,6 +632,10 @@
               h("td", null, r.needs_human ? h(Pill, { kind: "mc-pill-warn" }, r.needs_human) : "0"),
               h("td", null, r.oldest_open_age_seconds ? dur(r.oldest_open_age_seconds) : h("span", { className: "mc-muted" }, "—")),
               h("td", null, num(r.resolved)),
+              // §7: the silenced bucket is its own count (an archived card carries no verdict and
+              // must never be read as a closure) — the cross view showed `resolved: 5` and nothing
+              // about the 2 silenced cards.
+              h("td", null, r.silenced ? h(Pill, { kind: "mc-pill-warn" }, num(r.silenced)) : num(r.silenced)),
               h("td", null, r.unrecognised_status ? h(Pill, { kind: "mc-pill-err" }, r.unrecognised_status) : "0"),
               h("td", null, r.maturity || h("span", { className: "mc-muted" }, "n/a")),
               h("td", { className: "mc-muted" }, (r.unmeasured || []).join("; ") || "—"));
@@ -637,6 +646,7 @@
             h("td", null, num(all.needs_human)),
             h("td", null, all.oldest_open_age_seconds ? dur(all.oldest_open_age_seconds) : "—"),
             h("td", null, num(all.resolved)),
+            h("td", null, all.silenced ? h(Pill, { kind: "mc-pill-warn" }, num(all.silenced)) : num(all.silenced)),
             h("td", null, num(all.unrecognised_status)),
             h("td", { className: "mc-muted" }, "n/a"),
             h("td", { className: "mc-muted" }, all.oldest_open_age_seconds ? "" : "no open case has an age"))))); 
